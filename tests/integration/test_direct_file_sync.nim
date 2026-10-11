@@ -135,6 +135,32 @@ suite "Daemon sessions":
       check turned[0].buddyId == BuddyOne
       check a.currentSessions()[0].outcome == "failed"
 
+  test "a dial that loses to a running session keeps that session's connection tracked":
+    # The losing dial replaced the running session's connection in
+    # buddyConnections and then dropped it, so the buddy showed as
+    # disconnected while it synced, and was dialed again.
+    withTestDir("daemon_dial_race"):
+      let folderA = testDir / "a"
+      let folderB = testDir / "b"
+      createDir(folderA)
+      createDir(folderB)
+      let a = startedDaemon(peerConfig(BuddyOne, BuddyTwo, testDir / "a-stores", @[syncFolder("folder-a", folderA)]))
+      let b = startedDaemon(peerConfig(BuddyTwo, BuddyOne, testDir / "b-stores", @[syncFolder("folder-b", folderB)]))
+      defer:
+        waitFor a.node.stop()
+        waitFor b.node.stop()
+
+      let running = newBuddyConnection()
+      a.activeSyncs[BuddyTwo] = true
+      a.buddyConnections[BuddyTwo] = running
+      check waitFor a.connectToBuddy(BuddyTwo, b.node.peerId, b.node.getAddrs())
+      check a.buddyConnections.getOrDefault(BuddyTwo) == running
+      check a.currentSessions()[^1].outcome == "turned away"
+      for _ in 0 ..< 200:
+        if not b.activeSyncs.getOrDefault(BuddyOne):
+          break
+        waitFor sleepAsync(chronos.milliseconds(50))
+
   test "a sync asked for from a GUI dials the buddy now":
     withTestDir("daemon_sync_request"):
       let folderA = testDir / "a"

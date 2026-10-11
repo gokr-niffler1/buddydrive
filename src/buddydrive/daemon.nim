@@ -286,14 +286,18 @@ proc endSession(daemon: Daemon, bc: BuddyConnection) {.async.} =
   await bc.close()
 
 proc runBuddySync(daemon: Daemon, bc: BuddyConnection, dialedBy: string, via: string) {.async.} =
+  ## The only place a connection becomes the buddy's tracked one: there is
+  ## one exactly while its session runs.
   let diagnosticKey = "buddy-" & bc.buddyId
   if daemon.activeSyncs.getOrDefault(bc.buddyId, false):
-    # Both sides dialed at once; the session already running wins.
+    # Both sides dialed at once; the session already running wins and keeps
+    # its connection tracked.
     discard daemon.beginSessionRecord(bc, dialedBy, via, "turned away")
-    await daemon.endSession(bc)
+    await bc.close()
     return
 
   daemon.activeSyncs[bc.buddyId] = true
+  daemon.buddyConnections[bc.buddyId] = bc
   defer:
     daemon.activeSyncs[bc.buddyId] = false
 
@@ -339,11 +343,6 @@ proc handleIncomingConnection*(daemon: Daemon, conn: Connection) {.async.} =
       discard daemon.beginSessionRecord(bc, "buddy", "direct", "turned away")
       await bc.close()
       return
-    if daemon.buddyConnections.hasKey(bc.buddyId):
-      let existing = daemon.buddyConnections[bc.buddyId]
-      if existing != nil:
-        await existing.close()
-    daemon.buddyConnections[bc.buddyId] = bc
     # libp2p closes an incoming stream as soon as its handler returns, so the
     # session has to run to the end inside the handler.
     await daemon.runBuddySync(bc, "buddy", "direct")
@@ -698,7 +697,6 @@ proc connectToBuddyViaRelay(daemon: Daemon, buddyId: string): Future[bool] {.asy
     if success:
       echo "Relay handshake successful with: ", bc.buddyName, " via ", relayConn.relayAddr
       daemon.diagnostics.del(buddyDiagnosticKey(buddyId))
-      daemon.buddyConnections[bc.buddyId] = bc
       asyncSpawn daemon.runBuddySync(bc, "us", "relay")
       return true
 
@@ -768,7 +766,6 @@ proc connectToBuddy*(daemon: Daemon, buddyId: string, peerId: PeerID, addrs: seq
         echo "Handshake successful with: ", bc.buddyName
         daemon.diagnostics.del(buddyDiagnosticKey(buddyId))
         daemon.diagnostics.del(buddyRelayDiagnosticKey(buddyId))
-        daemon.buddyConnections[bc.buddyId] = bc
         asyncSpawn daemon.runBuddySync(bc, "us", "direct")
         return true
 
@@ -837,20 +834,10 @@ proc connectToBuddies*(daemon: Daemon) {.async: (raises: []).} =
   echo "Checking ", daemon.config.buddies.len, " buddies..."
   
   for buddy in daemon.config.buddies:
-    if daemon.buddyConnections.hasKey(buddy.id.uuid):
-      let existing = daemon.buddyConnections.getOrDefault(buddy.id.uuid)
-      if existing == nil:
-        daemon.buddyConnections.del(buddy.id.uuid)
-      elif not existing.isConnected():
-        try:
-          await existing.close()
-        except CatchableError:
-          discard
-        daemon.buddyConnections.del(buddy.id.uuid)
-      else:
-        daemon.diagnostics.del(buddySyncDiagnosticKey(buddy.id.uuid))
-        continue
-    
+    if daemon.activeSyncs.getOrDefault(buddy.id.uuid, false):
+      daemon.diagnostics.del(buddySyncDiagnosticKey(buddy.id.uuid))
+      continue
+
     if buddy.pairingCode.len == 0:
       daemon.logDiagnostic(
         buddyDiagnosticKey(buddy.id.uuid),
