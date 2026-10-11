@@ -1,4 +1,5 @@
-import std/[json, options, os, sequtils, strutils, unittest]
+import std/[json, options, os, sequtils, strutils, tables, unittest]
+from std/times import fromUnix, toUnix
 import chronos
 import libp2p/stream/bridgestream
 import ../../../src/buddydrive/types
@@ -653,6 +654,73 @@ suite "Session sync":
       check not fileExists(testDir / "b-stores" / "escaped.txt")
       for path in walkDirRec(testDir, relative = true):
         check "escaped" notin path
+
+  proc bytesOf(s: string): seq[byte] =
+    @(s.toOpenArrayByte(0, s.high))
+
+  proc scriptedOwnerSync(cfg: AppConfig, folderId: string, entries: seq[FileEntry],
+      contents: Table[string, string]): bool =
+    ## Plays an owner with one unencrypted folder against the real storage
+    ## side in cfg, serving whatever it asks for from contents.
+    proc run(): Future[bool] {.async.} =
+      let (left, right) = bridgedConnections(closeTogether = false)
+      defer:
+        await left.close()
+        await right.close()
+      let protocol = newSyncProtocol()
+      let syncFut = syncBuddyFolders(cfg, BuddyOne, left, protocol)
+      await protocol.sendMessage(right, newFileList("shared", entries, folderId, encrypted = false))
+      await protocol.sendMessage(right, newSyncDone())
+      discard await protocol.receiveMessage(right)
+      await protocol.sendMessage(right, newListPathsRequest(folderId))
+      discard await protocol.receiveMessage(right)
+      await protocol.sendMessage(right, newSyncDone())
+      while true:
+        let msg = await protocol.receiveMessage(right)
+        if msg.isNone or msg.get().kind != msgFileRequest:
+          break
+        let data = bytesOf(contents.getOrDefault(msg.get().requestPath))
+        await protocol.sendMessage(right, newFileData(data, 0, data.len, true))
+        discard await protocol.receiveMessage(right)
+      await protocol.sendMessage(right, newSessionEnd())
+      discard await protocol.receiveMessage(right)
+      result = await syncFut
+    waitFor run()
+
+  test "a buddy cannot reach outside its storage folder through a symlink":
+    # Unencrypted folders are stored as real files, symlinks included. A link
+    # named like our temp file for another file used to be written through
+    # when that file arrived, and a link listed again as a file with the same
+    # hash had its target's mode and time changed.
+    withTestDir("session_symlink_escape"):
+      let victim = testDir / "victim.txt"
+      writeFile(victim, "original\n")
+      setFilePermissions(victim, {fpUserRead, fpUserWrite})
+      setLastModificationTime(victim, fromUnix(1_000_000))
+      let cfgB = peerConfig(BuddyTwo, BuddyOne, testDir / "b-stores", @[])
+
+      proc fileEntry(path, content: string, mode = 0o644): FileEntry =
+        FileEntry(path: path, encryptedPath: path, size: content.len, mtime: 2_000_000,
+          hash: hashToString(hashBytes(bytesOf(content))), mode: mode)
+      proc linkEntry(path, target: string): FileEntry =
+        FileEntry(path: path, encryptedPath: path, size: target.len, mtime: 2_000_000,
+          hash: hashToString(hashBytes(bytesOf(target))), symlinkTarget: target)
+
+      check scriptedOwnerSync(cfgB, "shared-id",
+        @[fileEntry("a", "first\n"), linkEntry("a.buddytmp", victim), linkEntry("link", victim)],
+        {"a": "first\n"}.toTable)
+      check scriptedOwnerSync(cfgB, "shared-id",
+        @[fileEntry("a", "pwned\n"), fileEntry("link", victim, mode = 0o777)],
+        {"a": "pwned\n", "link": victim}.toTable)
+
+      check readFile(victim) == "original\n"
+      check getFilePermissions(victim) == {fpUserRead, fpUserWrite}
+      check getLastModificationTime(victim).toUnix() == 1_000_000
+      let stored = testDir / "b-stores" / "shared-id"
+      check readFile(stored / "a") == "pwned\n"
+      check not symlinkExists(stored / "a.buddytmp")
+      check not symlinkExists(stored / "link")
+      check readFile(stored / "link") == victim
 
 suite "Stalled buddy":
   test "a buddy that goes silent mid-session is given up on":

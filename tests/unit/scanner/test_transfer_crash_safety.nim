@@ -1,4 +1,5 @@
 import std/[options, os, unittest]
+from std/times import fromUnix, toUnix
 import chronos
 import libp2p/stream/bufferstream
 import libp2p/stream/bridgestream
@@ -141,6 +142,43 @@ suite "transfer crash safety":
       let scanned = transfer.scanner.scanFile(testDir / "ok.bin")
       check scanned.mode == 0o640
       check scanned.mtime == 1_700_000_000
+
+  when defined(posix):
+    test "a symlink left at the temp path is replaced, not written through":
+      withTestDir("transfer_temp_symlink"):
+        let victim = testDir / "victim.txt"
+        writeFile(victim, "original\n")
+        createDir(testDir / "root")
+        createSymlink(victim, testDir / "root" / ("file.bin" & TempSuffix))
+        let (sender, receiver) = bridgedConnections(closeTogether = false)
+        let transfer = newTestTransfer(testDir / "root")
+        defer:
+          transfer.close()
+
+        let msg = newFileData(@[byte(1), 2, 3, 4], 0, 4, true, ckNone, 4)
+        let receiveFut = transfer.receiveFileData(receiver, "file.bin")
+        waitFor feedMessages(sender, transfer.protocol, @[msg])
+        let ackFut = transfer.protocol.receiveMessage(sender)
+
+        check waitFor receiveFut
+        discard waitFor ackFut
+        check readFile(victim) == "original\n"
+        check readFile(testDir / "root" / "file.bin") == "\x01\x02\x03\x04"
+        check not symlinkExists(testDir / "root" / "file.bin")
+
+    test "file metadata is never applied through a symlink":
+      withTestDir("transfer_metadata_symlink"):
+        let victim = testDir / "victim.txt"
+        writeFile(victim, "original\n")
+        setFilePermissions(victim, {fpUserRead, fpUserWrite})
+        setLastModificationTime(victim, fromUnix(1_000_000))
+        createSymlink(victim, testDir / "link")
+        var info: types.FileInfo
+        info.mode = 0o777
+        info.mtime = 2_000_000
+        applyFileMetadata(testDir / "link", info)
+        check getFilePermissions(victim) == {fpUserRead, fpUserWrite}
+        check getLastModificationTime(victim).toUnix() == 1_000_000
 
   test "receiveFileData fails on hash mismatch and removes final file":
     withTestDir("transfer_hash_mismatch"):

@@ -58,12 +58,13 @@ proc stringToBytes(value: string): seq[byte] =
 proc safeJoin*(root: string, relativePath: string): Option[string] =
   ## Joins a path that came from a buddy onto a local root, refusing anything
   ## that could land outside it: absolute paths, empty or dot components, and
-  ## parent directories that are symlinks.
+  ## parent directories that are symlinks. Names of our own temp files are
+  ## refused too: a buddy's symlink by that name would be written through.
   if relativePath.len == 0 or relativePath.isAbsolute() or '\0' in relativePath:
     return none(string)
   let parts = relativePath.split({DirSep, AltSep})
   for part in parts:
-    if part.len == 0 or part == "." or part == "..":
+    if part.len == 0 or part == "." or part == ".." or part.endsWith(TempSuffix):
       return none(string)
   var current = root
   for i in 0 ..< parts.len - 1:

@@ -180,6 +180,11 @@ proc modeToPermissions(mode: int): set[FilePermission] =
     result.incl(fpOthersExec)
 
 proc applyFileMetadata*(path: string, fileInfo: FileInfo) {.raises: [].} =
+  ## Never through a symlink: both calls would change the link's target,
+  ## which a buddy can point anywhere.
+  if symlinkExists(path):
+    return
+
   if fileInfo.symlinkTarget.len == 0 and fileInfo.mode != 0:
     try:
       setFilePermissions(path, modeToPermissions(fileInfo.mode))
@@ -436,6 +441,10 @@ proc receiveFileData*(transfer: FileTransfer, conn: Connection, fileInfo: FileIn
   if success:
     try:
       createDir(fullPath.parentDir())
+      # Chunks are written into an existing file without truncating it or
+      # checking for a symlink, so whatever is left at the temp path goes.
+      if symlinkExists(tmpPath) or fileExists(tmpPath):
+        removeFile(tmpPath)
     except CatchableError:
       success = false
 

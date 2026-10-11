@@ -451,10 +451,12 @@ proc filesToFetch*(storage: StorageFolder, ownerFiles: seq[FileInfo]): tuple[fet
     if storage.appendOnly:
       continue
     let held = stored[info.encryptedPath]
-    if held.hash != info.hash or held.size != info.size:
-      result.fetch.add(info)
-    elif held.mode != info.mode or held.mtime != info.mtime or
+    # A plain file whose content is a link's target hashes like the link, so
+    # a link turned file (or back) is told apart by its target.
+    if held.hash != info.hash or held.size != info.size or
         (storage.plain != nil and held.symlinkTarget != info.symlinkTarget):
+      result.fetch.add(info)
+    elif held.mode != info.mode or held.mtime != info.mtime:
       result.metadata.add(info)
 
 proc storeFromOwner*(storage: StorageFolder, conn: Connection, info: FileInfo): Future[bool] {.async.} =

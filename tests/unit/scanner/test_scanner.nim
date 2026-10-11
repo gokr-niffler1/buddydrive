@@ -339,6 +339,12 @@ suite "safeJoin":
       check safeJoin(testDir, "a//b").isNone
       check safeJoin(testDir, "./a").isNone
 
+  test "rejects our own temp file names":
+    withTestDir("safejoin_temp"):
+      check safeJoin(testDir, "a.txt" & TempSuffix).isNone
+      check safeJoin(testDir, "d" & TempSuffix & "/a.txt").isNone
+      check safeJoin(testDir, "a.buddytmp.txt").isSome
+
   when defined(posix):
     test "rejects paths through a symlinked directory":
       withTestDir("safejoin_symlink"):
