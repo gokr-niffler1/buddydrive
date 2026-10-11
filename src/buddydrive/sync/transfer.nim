@@ -120,24 +120,31 @@ proc pruneConfirmedDeletes*(transfer: FileTransfer, buddyId: string, backupBuddi
     except CatchableError:
       return
 
-  let confirmations = transfer.index.deleteConfirmations()
-  for path in confirmations.keys:
-    if path in onDisk:
-      # The file is back; earlier confirmations were for a delete that no
-      # longer applies.
-      transfer.index.clearDeleteConfirmations(path)
+  # A failed index write stops the pruning. A tombstone kept too long only
+  # sends its delete again; one dropped too early brings the file back.
+  try:
+    let confirmations = transfer.index.deleteConfirmations()
+    for path in confirmations.keys:
+      if path in onDisk:
+        # The file is back; earlier confirmations were for a delete that no
+        # longer applies.
+        transfer.index.clearDeleteConfirmations(path)
 
-  for existing in transfer.index.getAllFiles():
-    if existing.path in onDisk:
-      continue
-    transfer.index.confirmDelete(existing.path, buddyId)
-    var confirmed =
-      if existing.path in confirmations: confirmations[existing.path]
-      else: initHashSet[string]()
-    confirmed.incl(buddyId)
-    if backupBuddies.allIt(it in confirmed):
-      transfer.index.removeFile(existing.path)
-      transfer.index.clearDeleteConfirmations(existing.path)
+    for existing in transfer.index.getAllFiles():
+      if existing.path in onDisk:
+        continue
+      transfer.index.confirmDelete(existing.path, buddyId)
+      var confirmed =
+        if existing.path in confirmations: confirmations[existing.path]
+        else: initHashSet[string]()
+      confirmed.incl(buddyId)
+      if backupBuddies.allIt(it in confirmed):
+        # Confirmations first: left behind without their tombstone they would
+        # count for a later delete of the same path.
+        transfer.index.clearDeleteConfirmations(existing.path)
+        transfer.index.removeFile(existing.path)
+  except CatchableError:
+    return
 
 proc useEncryptedChunks(transfer: FileTransfer): bool =
   transfer.scanner.folder.encrypted and transfer.scanner.folder.folderKey.len == KeySize

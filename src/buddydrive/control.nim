@@ -25,6 +25,9 @@ var storageUsageCache = initTable[string, tuple[files: int, bytes: int64, at: Ti
 proc getStateDb(): DbConn =
   let path = config.getDataDir() / "state.db"
   result = open(path, "", "", "")
+  # The control thread reads while the daemon writes; wait for the other
+  # instead of failing at once.
+  result.exec(sql"PRAGMA busy_timeout = 5000")
   result.exec(sql"""
     CREATE TABLE IF NOT EXISTS runtime_status (
       id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -169,6 +172,8 @@ proc writeLiveStatus*(buddyStatuses: seq[BuddyStatus], folderStatuses: seq[SyncS
   config.ensureDataDir()
   let db = getStateDb()
   try:
+    # One transaction, so a reader never sees the tables emptied.
+    db.exec(sql"BEGIN")
     db.exec(sql"DELETE FROM buddy_state")
     for b in buddyStatuses:
       db.exec(sql"""
@@ -183,6 +188,7 @@ proc writeLiveStatus*(buddyStatuses: seq[BuddyStatus], folderStatuses: seq[SyncS
         INSERT INTO folder_state (name, total_bytes, synced_bytes, file_count, synced_files, status, detail, last_sync)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
       """, f.folder, f.totalBytes, f.syncedBytes, f.fileCount, f.syncedFiles, f.status, f.detail, formatStatusTime(f.lastSync))
+    db.exec(sql"COMMIT")
   finally:
     db.close()
 

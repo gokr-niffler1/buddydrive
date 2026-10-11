@@ -9,6 +9,7 @@ import ../../../src/buddydrive/sync/scanner
 import ../../../src/buddydrive/sync/transfer
 import ../../../src/buddydrive/p2p/protocol
 import ../../../src/buddydrive/crypto
+from ../../../src/buddydrive/config import getIndexPath
 import ../../testutils
 
 useIsolatedDataDir("scanner")
@@ -394,3 +395,17 @@ suite "scanDirectoryStrict":
         defer: setFilePermissions(testDir / "sub", {fpUserRead, fpUserWrite, fpUserExec})
         expect ScannerError:
           discard newFileScanner(newFolderConfig("t", testDir)).scanDirectoryStrict()
+
+    test "a scan that cannot record what it found raises":
+      # The index row is the only record that we held a path; without it a
+      # later delete would look like a file to restore.
+      withTestDir("strict_readonly_index"):
+        writeFile(testDir / "a.txt", "a")
+        newIndex("strict-ro").close()
+        setFilePermissions(getIndexPath(), {fpUserRead})
+        defer: setFilePermissions(getIndexPath(), {fpUserRead, fpUserWrite})
+        let index = newIndex("strict-ro")
+        defer: index.close()
+        let scanner = newFileScanner(newFolderConfig("t", testDir), index)
+        expect ScannerError:
+          discard scanner.scanDirectoryStrict()

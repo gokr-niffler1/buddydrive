@@ -93,6 +93,7 @@ proc newIndex*(folderName: string, legacyKey = ""): FileIndex =
   result.db = db
 
   try:
+    db.exec(sql"PRAGMA busy_timeout = 5000")
     result.migrate()
     result.adoptLegacyRows(legacyKey)
   except CatchableError:
@@ -127,6 +128,9 @@ proc addFile*(index: FileIndex, info: types.FileInfo, synced: bool = false) =
   discard index.db.tryExec(sql(query), index.folderName, info.path, info.encryptedPath, info.size, info.mtime, hashStr, info.mode, info.symlinkTarget, if synced: 1 else: 0, lastSync)
 
 proc cacheScannedFile*(index: FileIndex, info: types.FileInfo) =
+  ## Raises when the row cannot be written. It is the only record that we
+  ## held the path, and without it a later delete looks like a file to
+  ## restore. This and the delete bookkeeping below must not fail silently.
   let hashStr = hashToString(info.hash)
   let query = """
     INSERT INTO files (folder, path, encrypted_path, size, mtime, hash, mode, symlink_target)
@@ -139,11 +143,11 @@ proc cacheScannedFile*(index: FileIndex, info: types.FileInfo) =
       mode = excluded.mode,
       symlink_target = excluded.symlink_target
   """
-  discard index.db.tryExec(sql(query), index.folderName, info.path, info.encryptedPath, info.size, info.mtime, hashStr, info.mode, info.symlinkTarget)
+  index.db.exec(sql(query), index.folderName, info.path, info.encryptedPath, info.size, info.mtime, hashStr, info.mode, info.symlinkTarget)
 
 proc removeFile*(index: FileIndex, path: string) =
   let query = "DELETE FROM files WHERE folder = ? AND path = ?"
-  discard index.db.tryExec(sql(query), index.folderName, path)
+  index.db.exec(sql(query), index.folderName, path)
 
 proc getFile*(index: FileIndex, path: string): Option[types.FileInfo] =
   let query = "SELECT path, encrypted_path, size, mtime, hash, mode, symlink_target FROM files WHERE folder = ? AND path = ?"
@@ -239,7 +243,7 @@ proc getSyncStatus*(index: FileIndex): tuple[total: int, synced: int, pending: i
 
 proc confirmDelete*(index: FileIndex, path: string, buddyId: string) =
   ## Records that a buddy has been told a file is gone.
-  discard index.db.tryExec(sql"INSERT OR IGNORE INTO delete_confirmations (folder, path, buddy) VALUES (?, ?, ?)",
+  index.db.exec(sql"INSERT OR IGNORE INTO delete_confirmations (folder, path, buddy) VALUES (?, ?, ?)",
     index.folderName, path, buddyId)
 
 proc deleteConfirmations*(index: FileIndex): Table[string, HashSet[string]] =
@@ -247,4 +251,4 @@ proc deleteConfirmations*(index: FileIndex): Table[string, HashSet[string]] =
     result.mgetOrPut(row[0], initHashSet[string]()).incl(row[1])
 
 proc clearDeleteConfirmations*(index: FileIndex, path: string) =
-  discard index.db.tryExec(sql"DELETE FROM delete_confirmations WHERE folder = ? AND path = ?", index.folderName, path)
+  index.db.exec(sql"DELETE FROM delete_confirmations WHERE folder = ? AND path = ?", index.folderName, path)
