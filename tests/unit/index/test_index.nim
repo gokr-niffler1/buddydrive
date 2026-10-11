@@ -1,5 +1,5 @@
 import std/unittest
-import std/[os, options]
+import std/[os, options, sets, tables]
 import db_connector/db_sqlite
 import ../../../src/buddydrive/types
 import ../../../src/buddydrive/sync/index
@@ -374,3 +374,49 @@ suite "Folder isolation":
       let r2 = idx2.getFile("same.txt")
       check r2.isSome
       check r2.get().size == 20
+
+suite "Legacy keys":
+  test "rows under the legacy key are taken over, tombstones included":
+    withTestDir("idxlegacy"):
+      putEnv("BUDDYDRIVE_CONFIG_DIR", testDir)
+      putEnv("BUDDYDRIVE_DATA_DIR", testDir)
+      defer:
+        delEnv("BUDDYDRIVE_CONFIG_DIR")
+        delEnv("BUDDYDRIVE_DATA_DIR")
+      let old = newIndex("docs|/data/docs")
+      var info: types.FileInfo
+      info.path = "gone.txt"
+      info.encryptedPath = "gone.txt"
+      old.addFile(info)
+      old.confirmDelete("gone.txt", "buddy-1")
+      old.close()
+
+      let idx = newIndex("folder-id|/data/docs", "docs|/data/docs")
+      defer: idx.close()
+      check idx.getFile("gone.txt").isSome
+      check "buddy-1" in idx.deleteConfirmations()["gone.txt"]
+      let left = newIndex("docs|/data/docs")
+      defer: left.close()
+      check left.getAllFiles().len == 0
+
+  test "rows already under the new key are kept as they are":
+    withTestDir("idxlegacykept"):
+      putEnv("BUDDYDRIVE_CONFIG_DIR", testDir)
+      putEnv("BUDDYDRIVE_DATA_DIR", testDir)
+      defer:
+        delEnv("BUDDYDRIVE_CONFIG_DIR")
+        delEnv("BUDDYDRIVE_DATA_DIR")
+      var info: types.FileInfo
+      info.path = "old.txt"
+      let old = newIndex("docs|/data/docs")
+      old.addFile(info)
+      old.close()
+      info.path = "new.txt"
+      let current = newIndex("folder-id|/data/docs")
+      current.addFile(info)
+      current.close()
+
+      let idx = newIndex("folder-id|/data/docs", "docs|/data/docs")
+      defer: idx.close()
+      check idx.getFile("new.txt").isSome
+      check idx.getFile("old.txt").isNone

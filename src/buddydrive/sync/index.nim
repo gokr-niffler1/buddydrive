@@ -62,17 +62,42 @@ proc migrate(index: FileIndex) =
 
   discard index.db.tryExec(sql("PRAGMA user_version = " & $SchemaVersion))
 
-proc newIndex*(folderName: string): FileIndex =
+proc adoptLegacyRows(index: FileIndex, legacyKey: string) =
+  ## Rows used to be kept under the folder's name and path, so renaming a
+  ## folder lost them, its tombstones included. They move to the new key the
+  ## first time it is used.
+  if legacyKey.len == 0 or legacyKey == index.folderName:
+    return
+  if index.db.getValue(sql"SELECT 1 FROM files WHERE folder = ? LIMIT 1", index.folderName).len > 0:
+    return
+  index.db.exec(sql"BEGIN")
+  try:
+    index.db.exec(sql"UPDATE files SET folder = ? WHERE folder = ?", index.folderName, legacyKey)
+    index.db.exec(sql"UPDATE OR IGNORE delete_confirmations SET folder = ? WHERE folder = ?",
+      index.folderName, legacyKey)
+    index.db.exec(sql"COMMIT")
+  except DbError:
+    discard index.db.tryExec(sql"ROLLBACK")
+    raise
+
+proc newIndex*(folderName: string, legacyKey = ""): FileIndex =
+  ## folderName is the key the folder's rows are kept under. Rows still under
+  ## legacyKey are taken over when there are none under folderName yet.
   result = FileIndex()
   result.folderName = folderName
-  
+
   let dbPath = config.getIndexPath()
   config.ensureDataDir()
-  
+
   let db = open(dbPath, "", "", "")
   result.db = db
-  
-  result.migrate()
+
+  try:
+    result.migrate()
+    result.adoptLegacyRows(legacyKey)
+  except CatchableError:
+    db.close()
+    raise
 
 proc close*(index: FileIndex) =
   if index.db != nil:

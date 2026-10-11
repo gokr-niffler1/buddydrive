@@ -7,7 +7,10 @@ import ../../../src/buddydrive/p2p/messages
 import ../../../src/buddydrive/p2p/protocol
 import ../../../src/buddydrive/sync/session
 import ../../../src/buddydrive/sync/index
+import ../../../src/buddydrive/sync/transfer
 import ../../../src/buddydrive/crypto
+from ../../../src/buddydrive/config import getIndexPath
+import db_connector/db_sqlite
 import ../../testutils
 import ../../support/sync_fixtures
 
@@ -545,6 +548,61 @@ suite "Session sync":
       check not fileExists(folderA / "flip.txt")
       check storedFiles(testDir / "b-stores" / "folder-a", ".blob").len == 0
       check storedFiles(testDir / "c-stores" / "folder-a", ".blob").len == 0
+
+  test "renaming a folder keeps its deletes":
+    # The index was keyed by the folder's name, so a rename lost every
+    # tombstone and a deleted file came back from a buddy that had not
+    # heard of the delete yet.
+    withTestDir("session_rename_folder"):
+      const BuddyThree = "33333333-3333-3333-3333-333333333333"
+      let folderA = testDir / "a"
+      createDir(folderA)
+      createDir(testDir / "b")
+      createDir(testDir / "c")
+      writeFile(folderA / "doomed.txt", "delete me\n")
+      writeFile(folderA / "kept.txt", "keep me\n")
+
+      var cfgA = peerConfig(BuddyOne, BuddyTwo, testDir / "a-stores-b", @[syncFolder("folder-a", folderA)])
+      var third: BuddyInfo
+      third.id = newBuddyId(BuddyThree, "peer-3333")
+      third.storagePath = testDir / "a-stores-c"
+      cfgA.buddies.add(third)
+      cfgA.folders[0].buddies = @[]
+      let cfgB = peerConfig(BuddyTwo, BuddyOne, testDir / "b-stores", @[syncFolder("folder-b", testDir / "b")])
+      let cfgC = peerConfig(BuddyThree, BuddyOne, testDir / "c-stores", @[syncFolder("folder-c", testDir / "c")])
+
+      syncPair(cfgA, BuddyTwo, cfgB)
+      syncPair(cfgA, BuddyThree, cfgC)
+      removeFile(folderA / "doomed.txt")
+      syncPair(cfgA, BuddyTwo, cfgB)            # B hears of the delete
+      cfgA.folders[0].name = "renamed"
+      syncPair(cfgA, BuddyThree, cfgC)          # C has not yet
+
+      check not fileExists(folderA / "doomed.txt")
+      check storedFiles(testDir / "c-stores" / "folder-a", ".blob").len == 1
+      syncPair(cfgA, BuddyTwo, cfgB)
+      check storedFiles(testDir / "b-stores" / "folder-a", ".blob").len == 1
+
+  test "an index kept under the folder's name and path still drives deletes":
+    withTestDir("session_legacy_index"):
+      let folderA = testDir / "a"
+      createDir(folderA)
+      createDir(testDir / "b")
+      writeFile(folderA / "doomed.txt", "delete me\n")
+      let cfgA = peerConfig(BuddyOne, BuddyTwo, testDir / "a-stores", @[syncFolder("folder-a", folderA)])
+      let cfgB = peerConfig(BuddyTwo, BuddyOne, testDir / "b-stores", @[syncFolder("folder-b", testDir / "b")])
+      syncBoth(cfgA, cfgB)
+
+      # Keyed as an older build left it.
+      let db = open(getIndexPath(), "", "", "")
+      db.exec(sql"UPDATE files SET folder = ? WHERE folder = ?",
+        cfgA.folders[0].name & "|" & folderA, indexKey(cfgA.folders[0]))
+      db.close()
+
+      removeFile(folderA / "doomed.txt")
+      syncBoth(cfgA, cfgB)
+      check not fileExists(folderA / "doomed.txt")
+      check storedFiles(testDir / "b-stores" / "folder-a", ".blob").len == 0
 
   proc syncAs(owner: AppConfig, buddy: AppConfig, machine: string, takeover = false, report: SessionReport = nil) =
     proc run(): Future[tuple[leftOk: bool, rightOk: bool]] {.async.} =

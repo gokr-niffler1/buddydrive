@@ -512,8 +512,9 @@ proc syncBuddyFolders*(
       report.note(folder.name, foSkipped, reason)
       continue
     sentIds[wireId] = folder.name
-    let transfer = newFileTransfer(folder, protocol, config.bandwidthLimitKBps)
+    var transfer: FileTransfer
     try:
+      transfer = newFileTransfer(folder, protocol, config.bandwidthLimitKBps)
       owned.add(OwnedFolder(
         transfer: transfer,
         files: transfer.scanner.scanDirectoryStrict(),
@@ -521,7 +522,8 @@ proc syncBuddyFolders*(
       ))
     except CatchableError as e:
       # Left out of this session entirely, so the buddy keeps its copy as is.
-      transfer.close()
+      if transfer != nil:
+        transfer.close()
       logSession("skipping " & folder.name & " this time: " & e.msg)
       report.note(folder.name, foSkipped, e.msg)
 

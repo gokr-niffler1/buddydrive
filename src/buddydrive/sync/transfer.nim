@@ -43,16 +43,28 @@ proc newThrottler*(bytesPerSecond: int): Throttler =
   result.lastTime = Moment.now()
   result.bytesSent = 0
 
+proc legacyIndexKey(folder: FolderConfig): string =
+  folder.name & "|" & folder.path
+
+proc indexKey*(folder: FolderConfig): string =
+  ## What the index keeps a folder's rows under: its stable id and where it
+  ## lives. A rename keeps them, tombstones included. A new location starts
+  ## afresh, so what the buddy stores is restored there rather than taken as
+  ## deleted.
+  if folder.id.len == 0:
+    return legacyIndexKey(folder)
+  folder.id & "|" & normalizedPath(folder.path)
+
 proc newFileTransfer*(folder: FolderConfig, protocol: SyncProtocol): FileTransfer =
   result = FileTransfer()
-  result.index = newIndex(folder.name & "|" & folder.path)
+  result.index = newIndex(indexKey(folder), legacyIndexKey(folder))
   result.scanner = newFileScanner(folder, result.index)
   result.protocol = protocol
   result.throttler = newThrottler(0)
 
 proc newFileTransfer*(folder: FolderConfig, protocol: SyncProtocol, bandwidthLimitKBps: int): FileTransfer =
   result = FileTransfer()
-  result.index = newIndex(folder.name & "|" & folder.path)
+  result.index = newIndex(indexKey(folder), legacyIndexKey(folder))
   result.scanner = newFileScanner(folder, result.index)
   result.protocol = protocol
   result.throttler = newThrottler(bandwidthLimitKBps * 1024)
@@ -126,11 +138,6 @@ proc pruneConfirmedDeletes*(transfer: FileTransfer, buddyId: string, backupBuddi
     if backupBuddies.allIt(it in confirmed):
       transfer.index.removeFile(existing.path)
       transfer.index.clearDeleteConfirmations(existing.path)
-
-proc knownIndexPaths*(transfer: FileTransfer): HashSet[string] =
-  ## Paths this folder has held at some point, according to the index.
-  for existing in transfer.index.getAllFiles():
-    result.incl(existing.path)
 
 proc useEncryptedChunks(transfer: FileTransfer): bool =
   transfer.scanner.folder.encrypted and transfer.scanner.folder.folderKey.len == KeySize
