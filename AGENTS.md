@@ -230,6 +230,21 @@ The new sync model is now **largely implemented**. See `docs/PLAN.md` for the fu
 - **Large folder listings**: file list exchange uses a single framed message (30MB max). Pagination or streaming deferred.
 - **Blocking discovery HTTP**: `publishBuddy`, `findBuddy` and `unpublishBuddy` (`discovery.nim`) call curly synchronously from async code, so an unreachable API stalls the chronos loop for up to 30 s per call. They belong on a worker thread.
 
+### Minor Known Issues
+
+Smaller leftovers from the code review of the multi-buddy-ownership branch. None of them changes the backup model's guarantees; each is a bounded cleanup.
+
+- **`sendBlob` can abort mid-stream without an ack** (`sync/storage.nim`): when a frame fails after earlier frames were already sent, it returns false without sending `msgFileAck`, so the owner waits for the 5-minute idle timeout instead of failing fast. Send `newFileAck(false)` on that path, as `receiveBlob` already does.
+- **`takeSyncRequests` can leave a `.taken` file** (`control.nim`): if the process stops between `moveFile` and `removeFile`, that file is never read again (the next request still lands in the original path). Clean stale `.taken` files up on startup, or read the requests without the rename.
+- **`addFile` still fails silently** (`sync/index.nim`): it uses `tryExec`/`discard`, unlike the other delete-critical writes (`cacheScannedFile`, `removeFile`, `confirmDelete`, `clearDeleteConfirmations`). A dropped row self-heals on the next scan, but make it raise for consistency.
+- **Legacy index adoption only matches the folder's current name** (`indexKey`/`legacyIndexKey` in `sync/transfer.nim`): a folder renamed on an older build before upgrading keeps its rows under `oldname|path` and they are never adopted, so its old tombstones are orphaned. Rare; only the new key's `name|path` form is looked for.
+- **`writeLiveStatus` has no explicit rollback** (`control.nim`): if a statement fails mid-transaction it relies on the connection closing to roll back, unlike `adoptLegacyRows` (`sync/index.nim`), which rolls back itself. Wrap it in `try/except` with `ROLLBACK` for the same guarantee.
+- **Restored symlink metadata is not verified consistently** (`sync/transfer.nim`): `applyFileMetadata` deliberately skips symlinks, but `verifyRestoredFile` still compares `expected.mode` for them; on a platform whose link permissions differ that could fail verification. Skip the mode check when `symlinkTarget` is set.
+- **An empty machine id bypasses the one-owner rule** (`sync/storage.nim`): `decideOwnership` accepts a listing whose `ownerMachine` is empty, so a peer whose id cannot be read has no ownership protection. The daemon now logs when its own id is unreadable; consider refusing instead.
+- **`saveConfig` races between the daemon and the control thread** (`config.nim`, `control.nim`, `daemon.nim`): both write `config.toml` through the same atomic temp-file + rename, so the file never tears, but a concurrent reload/save can still lose one side's update. Serialize config writes (a lock, or make the daemon the only writer).
+- **`connect` and `--daemon` are no-ops** (`cli.nim`): both are still advertised in the help text and in `init`'s output but only print "not implemented" (or are ignored). Implement them or remove them from the docs and CLI.
+- **`version.nim` claims `BuildTime` is UTC**: the comment says so, but Nim's `CompileTime` is local time. Convert it to UTC or fix the comment.
+
 ### HTTP Client (curly)
 
 - `curly` requires `--mm:arc/orc` and `--threads:on`
