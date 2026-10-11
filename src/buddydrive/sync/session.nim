@@ -495,7 +495,9 @@ proc syncBuddyFolders*(
       try:
         {.cast(gcsafe).}:
           machineId()
-      except Exception:
+      except Exception as e:
+        logSession("cannot read this machine's id (" & e.msg & "); buddies cannot tell it " &
+          "from another machine with the same identity")
         ""
   var owned: seq[OwnedFolder] = @[]
   defer:

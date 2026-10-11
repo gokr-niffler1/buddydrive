@@ -491,9 +491,13 @@ proc buddiesJson(): JsonNode =
 proc storageUsage(root: string): tuple[files: int, bytes: int64] =
   if not dirExists(root):
     return
-  for path in walkDirRec(root, relative = false):
-    if path.endsWith(".buddytmp"):
+  for relative in walkDirRec(root, relative = true):
+    if relative.endsWith(".buddytmp"):
       continue
+    if DirSep notin relative and relative.endsWith(".owner"):
+      # Records which machine owns the folder beside it; not a stored file.
+      continue
+    let path = root / relative
     if path.endsWith(".meta"):
       inc result.files
       continue

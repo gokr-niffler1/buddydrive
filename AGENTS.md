@@ -172,7 +172,7 @@ tests/
 - Chronos async procs enforce GC-safety — non-GC-safe calls (e.g., `parsetoml.parseFile`) must be wrapped with `{.cast(gcsafe).}:`
 - Chronos async procs enforce exception tracking — calls that can raise `SodiumError` must be wrapped in `try/except`
 - The control server runs synchronous HTTP in a dedicated thread
-- SQLite access via `db_connector/db_sqlite` (bundled with Nim 2.2.8+)
+- SQLite access via `db_connector/db_sqlite` (bundled with Nim 2.2.8+). Both databases set `PRAGMA busy_timeout = 5000`: the control thread reads `state.db` while the daemon writes it
 - Chronos async requires `{.cast(gcsafe).}` for cross-thread calls
 
 ### Encryption
@@ -196,7 +196,7 @@ The new sync model is now **largely implemented**. See `docs/PLAN.md` for the fu
 - **Encrypted backup model**: files stored encrypted on buddy's machine (filenames + content). Buddy is storage, not co-author. Sync is never a mirror between same-named folders.
 - **Per-buddy storage root**: `[[buddies]] storage_path`, else `<storage_base_path or ~/.buddydrive/storage>/<buddy-uuid>`. Each shared folder lives in `<root>/<folder-id>/` (see `buddyStorageRoot` in `config.nim`, `sync/storage.nim`).
 - **Opaque blobs**: encrypted folders are stored as `<hh>/<hash>.blob` (sealed chunk frames as sent) plus a `.meta` JSON sidecar. Unencrypted folders are stored as plain files.
-- **Paths from a buddy go through `safeJoin`** (`scanner.nim`) before touching disk.
+- **Paths from a buddy go through `safeJoin`** (`scanner.nim`) before touching disk. It also refuses `.buddytmp` names, and `applyFileMetadata` never follows a symlink: in unencrypted storage a buddy's symlink is a real link.
 - **Per-buddy sync_window + sync_interval**: `sync_window = "HH:MM-HH:MM"` (empty = any time; legacy `sync_time = "HH:MM"` is read as ±15 min) and `sync_interval = "30m"/"2h"` (empty = 5m until first contact, then 30m). Control when to initiate, not when to accept. A buddy that dials us is still looked up every 10 min (`RelayStandbyMinutes`) so relay rendezvous keeps working.
 - **Build ID**: `version.nim` takes the version from `buddydrive.nimble` and the git commit (`-dirty` if modified) at compile time; set `-d:buildCommit=<id>` where there is no git checkout. Printed at daemon start and returned by `GET /status` as `build`, with the wire protocol version.
 - **GUI locale**: `[gui] locale` (BCP 47, e.g. `sv-SE`; empty = browser's) set in the web GUI Settings. The API always sends UTC ISO 8601; `app.js` formats dates, sizes, counts and relative times with `Intl` in that locale (`makeFormatters`).
@@ -211,6 +211,7 @@ The new sync model is now **largely implemented**. See `docs/PLAN.md` for the fu
 - **Delete propagation**: `msgFileDelete` is sent and handled.
 - **Hash verification on restore**: `verifyRestoredFile` re-scans and checks hash after write.
 - **SQLite index is cache**: both sides maintain indexes for performance, but restore only needs the folder key + buddy's filesystem.
+- **Index rows are keyed by folder id + normalized path** (`indexKey` in `transfer.nim`), so a rename keeps a folder's tombstones and a new path starts afresh (stored files are restored there, not deleted). Rows under the old `name|path` key are taken over on first use. Writes that deletes depend on (`cacheScannedFile`, delete confirmations, `removeFile`) raise instead of failing silently.
 - **Restore flow**: recover config from relay → connect to buddy → list encrypted paths → decrypt paths → request missing files → verify hashes → rebuild index
 - **Discovery records are per buddy**: key = pairing code + publishing buddy's id; writes carry a stable owner token so a restarted buddy can replace its record (needs the matching buddydrive-relay).
 - **Discovery publishes public addresses only** (plus `announce_addr`). LAN buddies are reached via per-buddy `addresses` in config, dialed first.
@@ -227,6 +228,7 @@ The new sync model is now **largely implemented**. See `docs/PLAN.md` for the fu
 - **Long-lived CGNAT connections**: keepalive and prompt redial — not yet implemented.
 - **`init --with-recovery`**: parsed as CLI flag but does nothing. Use `init` then `setup-recovery`.
 - **Large folder listings**: file list exchange uses a single framed message (30MB max). Pagination or streaming deferred.
+- **Blocking discovery HTTP**: `publishBuddy`, `findBuddy` and `unpublishBuddy` (`discovery.nim`) call curly synchronously from async code, so an unreachable API stalls the chronos loop for up to 30 s per call. They belong on a worker thread.
 
 ### HTTP Client (curly)
 

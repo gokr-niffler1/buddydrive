@@ -574,7 +574,6 @@ proc getBuddyStatus*(daemon: Daemon): seq[BuddyStatus] =
       let bc = daemon.buddyConnections[buddy.id.uuid]
       if bc.isConnected():
         status.state = csConnected
-        status.latencyMs = int((getTime() - bc.lastActivity).inMilliseconds)
       else:
         status.state = csDisconnected
     else:

@@ -520,3 +520,10 @@ suite "Folder endpoints":
       check storedFileCount() == 1
       storageUsageMaxAge = initDuration(seconds = 0)
       check storedFileCount() == 2
+
+      # A folder's owner record is not one of the buddy's files; a file of
+      # theirs that happens to end the same way is.
+      writeFile(testDir / "bob" / "folder-x.owner", "{}")
+      createDir(testDir / "bob" / "folder-x")
+      writeFile(testDir / "bob" / "folder-x" / "notes.owner", "3")
+      check storedFileCount() == 3
