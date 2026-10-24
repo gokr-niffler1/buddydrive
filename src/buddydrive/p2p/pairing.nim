@@ -28,6 +28,8 @@ type
     conn*: Connection
     state*: PairingState
     lastActivity*: Time
+    failure*: string
+      ## Why the handshake failed, for the log.
 
 const
   PairingProtocol* = "/buddydrive/pairing/2.0.0"
@@ -53,16 +55,31 @@ proc sendBuddyId*(bc: BuddyConnection, buddyId: string, buddyName: string): Futu
   bc.lastActivity = getTime()
 
 proc receiveBuddyId*(bc: BuddyConnection): Future[Option[(string, string)]] {.async.} =
+  ## Reads the frame itself rather than through receiveFramedMessage, so a
+  ## buddy on another protocol version can be told apart from a stranger.
   try:
-    let msgOpt = await receiveFramedMessage(bc.conn)
-    if msgOpt.isNone:
+    var lenBytes: array[4, byte]
+    await bc.conn.readExactly(addr lenBytes[0], 4).wait(HandshakeTimeout)
+    let msgLen = int(lenBytes[0]) shl 24 or int(lenBytes[1]) shl 16 or
+                 int(lenBytes[2]) shl 8 or int(lenBytes[3])
+    if msgLen <= 0 or msgLen > MaxMessageSize:
+      bc.failure = "not a BuddyDrive handshake"
+      return none((string, string))
+    var data = newSeq[byte](msgLen)
+    await bc.conn.readExactly(addr data[0], msgLen).wait(HandshakeTimeout)
+
+    if data.len >= 2 and data[1] != ProtocolVersion:
+      bc.failure = "it speaks protocol version " & $data[1] & ", this build speaks " &
+        $ProtocolVersion & "; update the older side"
       return none((string, string))
 
-    let msg = msgOpt.get()
-    if msg.kind != msgFileList or msg.folderName != "BUDDYDRIVE_PAIRING":
+    let decoded = decode(data)
+    if decoded.isErr:
+      bc.failure = "unreadable handshake: " & decoded.error
       return none((string, string))
-
-    if msg.files.len != 1:
+    let msg = decoded.get()
+    if msg.kind != msgFileList or msg.folderName != "BUDDYDRIVE_PAIRING" or msg.files.len != 1:
+      bc.failure = "not a BuddyDrive handshake"
       return none((string, string))
 
     let buddyId = msg.files[0].path
@@ -72,7 +89,8 @@ proc receiveBuddyId*(bc: BuddyConnection): Future[Option[(string, string)]] {.as
     bc.lastActivity = getTime()
     
     return some((buddyId, buddyName))
-  except:
+  except CatchableError as e:
+    bc.failure = "no handshake received: " & e.msg
     return none((string, string))
 
 proc verifyBuddy*(bc: BuddyConnection, config: AppConfig): bool =
@@ -80,6 +98,7 @@ proc verifyBuddy*(bc: BuddyConnection, config: AppConfig): bool =
     if buddy.id.uuid == bc.buddyId:
       bc.buddyName = buddy.id.name
       return true
+  bc.failure = "buddy id " & bc.buddyId & " is not in this config"
   return false
 
 proc performHandshake*(bc: BuddyConnection, config: AppConfig): Future[bool] {.async.} =

@@ -12,7 +12,7 @@
 ## browsed.
 
 import std/os except FileInfo
-import std/[json, options, strutils, algorithm, tables]
+import std/[json, options, strutils, algorithm, tables, times]
 import chronos
 import libp2p/stream/connection
 import ../types
@@ -74,6 +74,58 @@ proc storageDirName*(folderId: string): string =
 
 proc storageFolderRoot*(config: AppConfig, ownerId: string, folderId: string): string =
   config.buddyStorageRoot(ownerId) / storageDirName(folderId)
+
+type
+  OwnershipDecision* = object
+    accepted*: bool
+    note*: string
+
+proc ownerRecordPath(config: AppConfig, ownerId: string, folderId: string): string =
+  ## Next to the folder's directory, not in it: inside, an unencrypted folder
+  ## would list it as one of the owner's files.
+  config.buddyStorageRoot(ownerId) / (storageDirName(folderId) & ".owner")
+
+proc decideOwnership*(config: AppConfig, ownerId: string, listing: ProtocolMessage): OwnershipDecision =
+  ## One machine owns each stored folder. Two machines with the same buddy
+  ## identity (say, a recovered one while the old one still runs) would
+  ## otherwise overwrite each other's backup. The first machine to send a
+  ## folder owns it; another is refused unless it explicitly takes over, after
+  ## which the previous one is refused instead.
+  let machine = listing.ownerMachine
+  if machine.len == 0:
+    return OwnershipDecision(accepted: true)
+
+  let path = config.ownerRecordPath(ownerId, listing.folderId)
+  var recorded = ""
+  var since = ""
+  if fileExists(path):
+    try:
+      let node = parseJson(readFile(path))
+      recorded = node{"machine"}.getStr("")
+      since = node{"since"}.getStr("")
+    except CatchableError:
+      discard
+
+  if recorded == machine:
+    return OwnershipDecision(accepted: true)
+
+  if recorded.len > 0 and not listing.ownerTakeover:
+    return OwnershipDecision(accepted: false, note:
+      "folder " & listing.folderName & " is backed up here from another machine (" &
+      recorded.shortId() & (if since.len > 0: ", since " & since else: "") &
+      "). If this machine replaces that one, run 'buddydrive takeover' on it.")
+
+  try:
+    createDir(path.parentDir())
+    writeFile(path, $(%*{"machine": machine, "since": now().utc.format("yyyy-MM-dd'T'HH:mm:ss'Z'")}))
+  except CatchableError as e:
+    return OwnershipDecision(accepted: false, note: "cannot record the owner of " & listing.folderName & ": " & e.msg)
+  if recorded.len > 0:
+    OwnershipDecision(accepted: true, note:
+      "folder " & listing.folderName & " taken over by machine " & machine.shortId() &
+      " from " & recorded.shortId())
+  else:
+    OwnershipDecision(accepted: true)
 
 proc newStorageFolder*(
     config: AppConfig,
@@ -204,6 +256,20 @@ proc applyMove*(storage: StorageFolder, oldPath: string, newPath: string): bool 
     removeFile(storage.metaPath(oldPath))
     true
   except:
+    false
+
+proc applyRehash*(storage: StorageFolder, path: string, hash: string): bool =
+  ## Records the owner's new content hash for a file we already hold.
+  if storage.plain != nil:
+    return true
+  try:
+    let stored = storage.readStoredMeta(path)
+    if stored.isNone:
+      return true
+    var info = stored.get()
+    info.hash = stringToHash(hash)
+    writeMeta(storage.metaPath(path), info)
+  except CatchableError:
     false
 
 proc applyDelete*(storage: StorageFolder, path: string): bool =
@@ -385,10 +451,12 @@ proc filesToFetch*(storage: StorageFolder, ownerFiles: seq[FileInfo]): tuple[fet
     if storage.appendOnly:
       continue
     let held = stored[info.encryptedPath]
-    if held.hash != info.hash or held.size != info.size:
-      result.fetch.add(info)
-    elif held.mode != info.mode or held.mtime != info.mtime or
+    # A plain file whose content is a link's target hashes like the link, so
+    # a link turned file (or back) is told apart by its target.
+    if held.hash != info.hash or held.size != info.size or
         (storage.plain != nil and held.symlinkTarget != info.symlinkTarget):
+      result.fetch.add(info)
+    elif held.mode != info.mode or held.mtime != info.mtime:
       result.metadata.add(info)
 
 proc storeFromOwner*(storage: StorageFolder, conn: Connection, info: FileInfo): Future[bool] {.async.} =

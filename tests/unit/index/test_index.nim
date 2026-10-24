@@ -1,5 +1,6 @@
 import std/unittest
-import std/[os, options]
+import std/[os, options, sets, tables]
+import db_connector/db_sqlite
 import ../../../src/buddydrive/types
 import ../../../src/buddydrive/sync/index
 import ../../../src/buddydrive/config as buddyconfig
@@ -322,135 +323,24 @@ suite "FileIndex getFileByEncryptedPath":
       defer: idx.close()
       check idx.getFileByEncryptedPath("nonexistent").isNone
 
-suite "Storage index operations":
-  test "addStorageFile and getStorageFile round-trip":
-    withTestDir("idxstorageadd"):
-      putEnv("BUDDYDRIVE_CONFIG_DIR", testDir)
-      putEnv("BUDDYDRIVE_DATA_DIR", testDir)
-      defer:
-        delEnv("BUDDYDRIVE_CONFIG_DIR")
-        delEnv("BUDDYDRIVE_DATA_DIR")
-      let idx = newIndex("f16")
-      defer: idx.close()
-      var info: types.StorageFileInfo
-      info.encryptedPath = "enc_photo.jpg"
-      for i in 0..<32: info.contentHash[i] = byte(i + 5)
-      info.size = 2048
-      info.mode = 0o600
-      info.symlinkTarget = ""
-      info.ownerBuddy = "buddy-abc"
-      idx.addStorageFile(info)
-      let retrieved = idx.getStorageFile("enc_photo.jpg", "buddy-abc")
-      check retrieved.isSome
-      check retrieved.get().encryptedPath == "enc_photo.jpg"
-      check retrieved.get().contentHash == info.contentHash
-      check retrieved.get().size == 2048
-      check retrieved.get().mode == 0o600
-      check retrieved.get().symlinkTarget == ""
-      check retrieved.get().ownerBuddy == "buddy-abc"
-
-  test "getStorageFile returns none for missing file":
-    withTestDir("idxstoragemiss"):
-      putEnv("BUDDYDRIVE_CONFIG_DIR", testDir)
-      putEnv("BUDDYDRIVE_DATA_DIR", testDir)
-      defer:
-        delEnv("BUDDYDRIVE_CONFIG_DIR")
-        delEnv("BUDDYDRIVE_DATA_DIR")
-      let idx = newIndex("f17")
-      defer: idx.close()
-      check idx.getStorageFile("nope", "buddy-xyz").isNone
-
-  test "removeStorageFile removes entry":
-    withTestDir("idxstoragerm"):
-      putEnv("BUDDYDRIVE_CONFIG_DIR", testDir)
-      putEnv("BUDDYDRIVE_DATA_DIR", testDir)
-      defer:
-        delEnv("BUDDYDRIVE_CONFIG_DIR")
-        delEnv("BUDDYDRIVE_DATA_DIR")
-      let idx = newIndex("f18")
-      defer: idx.close()
-      var info: types.StorageFileInfo
-      info.encryptedPath = "to-rm.dat"
-      for i in 0..<32: info.contentHash[i] = byte(i)
-      info.size = 100
-      info.ownerBuddy = "buddy-rm"
-      idx.addStorageFile(info)
-      check idx.getStorageFile("to-rm.dat", "buddy-rm").isSome
-      idx.removeStorageFile("to-rm.dat", "buddy-rm")
-      check idx.getStorageFile("to-rm.dat", "buddy-rm").isNone
-
-  test "listByOwner returns all files for a buddy":
-    withTestDir("idxlistbyowner"):
-      putEnv("BUDDYDRIVE_CONFIG_DIR", testDir)
-      putEnv("BUDDYDRIVE_DATA_DIR", testDir)
-      defer:
-        delEnv("BUDDYDRIVE_CONFIG_DIR")
-        delEnv("BUDDYDRIVE_DATA_DIR")
-      let idx = newIndex("f19")
-      defer: idx.close()
-      for i in 0..<3:
-        var info: types.StorageFileInfo
-        info.encryptedPath = "file" & $i & ".enc"
-        for j in 0..<32: info.contentHash[j] = byte(i * 32 + j)
-        info.size = int64(i * 100)
-        info.ownerBuddy = "buddy-list"
-        idx.addStorageFile(info)
-      var otherInfo: types.StorageFileInfo
-      otherInfo.encryptedPath = "other.enc"
-      for j in 0..<32: otherInfo.contentHash[j] = byte(j)
-      otherInfo.size = 999
-      otherInfo.ownerBuddy = "buddy-other"
-      idx.addStorageFile(otherInfo)
-      let files = idx.listByOwner("buddy-list")
-      check files.len == 3
-      let otherFiles = idx.listByOwner("buddy-other")
-      check otherFiles.len == 1
-
-  test "updateStoragePath renames encrypted path":
-    withTestDir("idxstorageupdate"):
-      putEnv("BUDDYDRIVE_CONFIG_DIR", testDir)
-      putEnv("BUDDYDRIVE_DATA_DIR", testDir)
-      defer:
-        delEnv("BUDDYDRIVE_CONFIG_DIR")
-        delEnv("BUDDYDRIVE_DATA_DIR")
-      let idx = newIndex("f20")
-      defer: idx.close()
-      var info: types.StorageFileInfo
-      info.encryptedPath = "old_path.enc"
-      for i in 0..<32: info.contentHash[i] = byte(i)
-      info.size = 500
-      info.mode = 0o777
-      info.symlinkTarget = "dir/target"
-      info.ownerBuddy = "buddy-move"
-      idx.addStorageFile(info)
-      idx.updateStoragePath("old_path.enc", "new_path.enc", "buddy-move")
-      check idx.getStorageFile("old_path.enc", "buddy-move").isNone
-      let moved = idx.getStorageFile("new_path.enc", "buddy-move")
-      check moved.isSome
-      check moved.get().contentHash == info.contentHash
-      check moved.get().size == 500
-      check moved.get().mode == 0o777
-      check moved.get().symlinkTarget == "dir/target"
-
 suite "Schema migration":
-  test "opening existing DB runs migration to v3":
+  test "an index from before v5 loses its unused storage_files table":
     withTestDir("idxmigration"):
       putEnv("BUDDYDRIVE_CONFIG_DIR", testDir)
       putEnv("BUDDYDRIVE_DATA_DIR", testDir)
       defer:
         delEnv("BUDDYDRIVE_CONFIG_DIR")
         delEnv("BUDDYDRIVE_DATA_DIR")
-      let idx1 = newIndex("f-mig")
-      idx1.close()
-      let idx2 = newIndex("f-mig")
-      defer: idx2.close()
-      var sinfo: types.StorageFileInfo
-      sinfo.encryptedPath = "mig_test.enc"
-      for i in 0..<32: sinfo.contentHash[i] = byte(i)
-      sinfo.size = 100
-      sinfo.ownerBuddy = "buddy-mig"
-      idx2.addStorageFile(sinfo)
-      check idx2.getStorageFile("mig_test.enc", "buddy-mig").isSome
+      let old = open(buddyconfig.getIndexPath(), "", "", "")
+      old.exec(sql"CREATE TABLE storage_files (id INTEGER PRIMARY KEY, encrypted_path TEXT)")
+      old.exec(sql"PRAGMA user_version = 4")
+      old.close()
+      let idx = newIndex("f-mig")
+      idx.close()
+      let db = open(buddyconfig.getIndexPath(), "", "", "")
+      defer: db.close()
+      check db.getValue(sql"SELECT count(*) FROM sqlite_master WHERE name = 'storage_files'") == "0"
+      check db.getValue(sql"PRAGMA user_version") == "5"
 
 suite "Folder isolation":
   test "different folderNames in same DB are isolated":
@@ -484,3 +374,49 @@ suite "Folder isolation":
       let r2 = idx2.getFile("same.txt")
       check r2.isSome
       check r2.get().size == 20
+
+suite "Legacy keys":
+  test "rows under the legacy key are taken over, tombstones included":
+    withTestDir("idxlegacy"):
+      putEnv("BUDDYDRIVE_CONFIG_DIR", testDir)
+      putEnv("BUDDYDRIVE_DATA_DIR", testDir)
+      defer:
+        delEnv("BUDDYDRIVE_CONFIG_DIR")
+        delEnv("BUDDYDRIVE_DATA_DIR")
+      let old = newIndex("docs|/data/docs")
+      var info: types.FileInfo
+      info.path = "gone.txt"
+      info.encryptedPath = "gone.txt"
+      old.addFile(info)
+      old.confirmDelete("gone.txt", "buddy-1")
+      old.close()
+
+      let idx = newIndex("folder-id|/data/docs", "docs|/data/docs")
+      defer: idx.close()
+      check idx.getFile("gone.txt").isSome
+      check "buddy-1" in idx.deleteConfirmations()["gone.txt"]
+      let left = newIndex("docs|/data/docs")
+      defer: left.close()
+      check left.getAllFiles().len == 0
+
+  test "rows already under the new key are kept as they are":
+    withTestDir("idxlegacykept"):
+      putEnv("BUDDYDRIVE_CONFIG_DIR", testDir)
+      putEnv("BUDDYDRIVE_DATA_DIR", testDir)
+      defer:
+        delEnv("BUDDYDRIVE_CONFIG_DIR")
+        delEnv("BUDDYDRIVE_DATA_DIR")
+      var info: types.FileInfo
+      info.path = "old.txt"
+      let old = newIndex("docs|/data/docs")
+      old.addFile(info)
+      old.close()
+      info.path = "new.txt"
+      let current = newIndex("folder-id|/data/docs")
+      current.addFile(info)
+      current.close()
+
+      let idx = newIndex("folder-id|/data/docs", "docs|/data/docs")
+      defer: idx.close()
+      check idx.getFile("new.txt").isSome
+      check idx.getFile("old.txt").isNone

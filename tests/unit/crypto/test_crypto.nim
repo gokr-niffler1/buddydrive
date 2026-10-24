@@ -223,6 +223,16 @@ suite "Encrypt/Decrypt API edge cases":
     expect CryptoError:
       discard decrypt(enc, "shortkey")
 
+suite "Keyed content hash":
+  test "depends on the folder key and hides the plain hash":
+    var plain: array[32, byte]
+    for i in 0 ..< 32: plain[i] = byte(i)
+    let keyA = generateKey()
+    let keyB = generateKey()
+    check keyedContentHash(plain, keyA) == keyedContentHash(plain, keyA)
+    check keyedContentHash(plain, keyA) != keyedContentHash(plain, keyB)
+    check keyedContentHash(plain, keyA) != plain
+
 suite "Streaming hash":
   test "hashFileStream returns 32 bytes":
     let tmpDir = getTempDir() / "buddydrive_test_hashfile_" & $getTime().toUnix()

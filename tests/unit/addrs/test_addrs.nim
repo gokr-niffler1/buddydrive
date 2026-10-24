@@ -58,3 +58,17 @@ suite "Private address ranges":
     check isPrivateOrLoopback(ma("/ip4/100.64.0.1/tcp/1"))
     check not isPrivateOrLoopback(ma("/ip4/100.128.0.1/tcp/1"))
     check not isPrivateOrLoopback(ma("/ip4/8.8.8.8/tcp/1"))
+
+suite "LAN hosts":
+  test "private IPv4 addresses, without loopback, public or duplicates":
+    let addrs = @[
+      ma("/ip4/127.0.0.1/tcp/41721"),
+      ma("/ip4/192.168.1.223/tcp/41721"),
+      ma("/ip4/192.168.1.79/tcp/41721"),
+      ma("/ip4/85.24.176.102/tcp/41721"),
+      ma("/ip4/192.168.1.223/tcp/41722"),
+    ]
+    check lanHosts(addrs) == @["192.168.1.223", "192.168.1.79"]
+
+  test "none when only loopback is bound":
+    check lanHosts(@[ma("/ip4/127.0.0.1/tcp/41721")]).len == 0

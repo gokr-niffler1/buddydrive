@@ -179,10 +179,11 @@ buddydrive config set api-base-url https://api.buddydrive.org
 buddydrive config set relay-region eu
 ```
 
-- Per-buddy sync scheduling: set a sync time for each buddy to control when to initiate connections:
+- Per-buddy sync scheduling: set a sync window and interval for each buddy to control when to initiate connections:
 
 ```bash
-buddydrive config set buddy-sync-time <buddy-id> 03:00
+buddydrive config set buddy-sync-window <buddy-id> 22:00-06:00
+buddydrive config set buddy-sync-interval <buddy-id> 2h
 ```
 
 The public TCP relay is at `relay-eu.buddydrive.org:41722`. The HTTP API (discovery, config sync, relay list) is at `https://api.buddydrive.org`. See the [buddydrive-relay repository](https://github.com/gokr/buddydrive-relay) for relay details and self-hosting notes.

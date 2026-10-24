@@ -37,6 +37,18 @@ proc isPrivateOrLoopback*(ma: MultiAddress): bool =
       return true
   false
 
+proc lanHosts*(addrs: seq[MultiAddress]): seq[string] =
+  ## The private IPv4 addresses among ours, for telling the user where the
+  ## web GUI is reachable on their network.
+  for ma in addrs:
+    if isRelayAddress(ma) or isLoopbackOrLinkLocal(ma) or not isPrivateOrLoopback(ma):
+      continue
+    let o = ip4Octets(ma)
+    if o.len == 4:
+      let host = o.join(".")
+      if host notin result:
+        result.add(host)
+
 proc isTcp(ma: MultiAddress): bool =
   ($ma).contains("/tcp/")
 

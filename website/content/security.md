@@ -78,12 +78,14 @@ When folder encryption is enabled (default):
 Your buddy **cannot** see:
 - Your original filenames (encrypted with deterministic path encryption)
 - Your file contents (encrypted with random nonces per chunk)
+- Whether you have a particular file: the content hashes it keeps are keyed with the folder key, so they cannot be matched against files your buddy already knows
 - The encrypted recovery config stored in the relay without your recovery phrase
 - Your other buddies' configuration unless you share it with them
 
 Your buddy **can** see:
+- How many files you back up, and each file's size, modification time and permission bits
+- When a file's content changes (its keyed hash changes)
 - The total storage use and sync timing
-- The size of encrypted blobs on disk
 
 When folder encryption is disabled (`encrypted = false`):
 - Your buddy can see folder and file names, and read file contents

@@ -127,6 +127,7 @@ journalctl -u buddydrive -f
 | `buddydrive recover` | Restore config from a 12-word recovery phrase and then resync folders |
 | `buddydrive sync-config` | Manually push encrypted config to the relay and configured buddies |
 | `buddydrive export-recovery` | Show stored recovery public key and master key metadata |
+| `buddydrive takeover` | Make this machine the owner of your folders at your buddies, replacing another machine |
 
 ### config set Keys
 
@@ -138,7 +139,8 @@ journalctl -u buddydrive -f
 | `bandwidth-limit` | `<kbps>` | Set bandwidth limit (0 = unlimited) |
 | `buddy-pairing-code` | `<buddy-id> <code>` | Set pairing code for a buddy |
 | `buddy-name` | `<name>` | Update your buddy display name |
-| `buddy-sync-time` | `<buddy-id> <HH:MM>` | Set per-buddy sync time (empty = always) |
+| `buddy-sync-window` | `<buddy-id> <HH:MM-HH:MM\|off>` | When this machine may start a sync with the buddy (off = any time). `buddy-sync-time` is an alias |
+| `buddy-sync-interval` | `<buddy-id> <30m\|2h\|1h30m\|off>` | How often to sync with the buddy (off = every 5m until first contact, then 30m) |
 | `buddy-addresses` | `<buddy-id> <multiaddr[,multiaddr]\|none>` | Known addresses for a buddy, dialed before discovered ones (e.g. a buddy on your LAN) |
 | `buddy-storage-path` | `<buddy-id> <path\|default>` | Folder where this buddy's backups are kept on your machine |
 | `folder-append-only` | `<folder-name> <on\|off>` | Toggle folder append-only mode |
@@ -214,21 +216,28 @@ Restore happens in two layers:
 
 Append-only folders still protect existing local files from being overwritten or deleted by the remote side.
 
+### One Machine Per Identity
+
+Each buddy stores your folders for one machine at a time. Machines are told apart by a machine id kept in the data directory (`machine-id`), not in `config.toml`, so a recovered config does not carry it along. The first machine to back up a folder owns it there; another machine with the same identity is refused, and the log says so, rather than both overwriting each other's backup.
+
+When a machine replaces another one, it takes over: `buddydrive recover` does this automatically, and `buddydrive takeover` does it for a config you copied by hand. On its next sync with each buddy the new machine claims your folders, restores what they hold, and from then on the old machine is refused. Only take over from a machine you have retired.
+
 ### Folder Policies
 
 - **Encrypted** — folder encryption flag (default true). When enabled, filenames and content are encrypted before being stored on the buddy's machine. Path encryption uses deterministic nonces (same path always encrypts the same way, enabling move detection). Content encryption uses random nonces per chunk (prevents nonce reuse across versions).
 - **Append-only** — prevents remote overwrites and remote deletions of existing local files. Missing files are still created. Because the folder never drops a file, a file deleted on the other side is restored back to it from the append-only copy on a later sync
 - **Buddy-specific** — restrict a folder to sync with a specific buddy
 
-### Per-Buddy Sync Time
+### Per-Buddy Sync Window and Interval
 
-Each buddy can have an optional sync time that controls when to initiate a connection. Incoming connections from known buddies are always accepted regardless of sync time.
+Each buddy has an optional sync window and sync interval that control when this machine initiates a connection. Incoming connections from known buddies are always accepted regardless of either. Both can also be set with Edit on a buddy in the web GUI.
 
 ```bash
-buddydrive config set buddy-sync-time <buddy-id> 03:00
+buddydrive config set buddy-sync-window <buddy-id> 22:00-06:00
+buddydrive config set buddy-sync-interval <buddy-id> 2h
 ```
 
-When sync time is empty (default), the daemon initiates connections whenever it discovers a buddy address. When set to a time like `03:00`, the daemon only initiates within a 15-minute tolerance window around that time.
+An empty window means any time; a window may cross midnight. A single time such as `03:00` (the older `sync_time` form) means the half hour around it. An empty interval means every 5 minutes until the buddy has been reached once, then every 30 minutes. The interval counts from the last attempt or session, whoever dialed.
 
 ## How It Works
 
@@ -304,6 +313,9 @@ relay_region = "eu"
 storage_base_path = ""
 bandwidth_limit_kbps = 0
 
+[gui]
+locale = "sv-SE"   # optional: date and number format in the web GUI; empty = the browser's language
+
 [[folders]]
 id = "f47ac10b-58cc-4372-a567-0e02b2c3d479"
 name = "docs"
@@ -317,7 +329,8 @@ buddies = ["buddy-id-here"]
 id = "buddy-id-here"
 name = "cranky-wrench"
 pairing_code = "ABCD-EFGH"
-sync_time = "03:00"
+sync_window = "22:00-06:00"   # optional; older configs with sync_time are still read
+sync_interval = "2h"          # optional
 storage_path = "/mnt/backup/cranky-wrench"
 addresses = ["/ip4/192.168.1.101/tcp/41721"]   # optional, see below
 added_at = "2026-04-10T12:00:00Z"
@@ -455,6 +468,7 @@ When `encrypted = true` on a folder:
 - **File content** is split into 64KB chunks, each encrypted with a random 24-byte nonce prepended to the ciphertext. Random nonces prevent nonce reuse when the same file is modified across versions.
 - **Folder key** is derived from `crypto_generichash(masterKey + "/folder/" + folderId)` when recovery is enabled, or a random key stored in `folder_key` in config.toml otherwise.
 - Your buddy stores fully opaque encrypted blobs — they cannot read filenames or content.
+- The content hash your buddy keeps is keyed with the folder key, so it cannot be matched against files they know. They do see each file's size, mtime and permission bits.
 
 When `encrypted = false`:
 - Files are stored plaintext on the buddy's machine for collaboration.

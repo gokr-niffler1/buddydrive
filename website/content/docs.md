@@ -98,6 +98,8 @@ buddydrive start
 
 Enter the same 12-word recovery phrase. If relay recovery succeeds, BuddyDrive restores your config locally. Starting the daemon then lets normal sync recreate missing files.
 
+Each buddy keeps one machine as the owner of a folder, so two machines with the same identity cannot overwrite each other's backup. `recover` makes the new machine the owner at each buddy on its next sync; from then on the old machine is refused. If you moved `config.toml` by hand instead, run `buddydrive takeover` before starting the daemon.
+
 Current limitation: the CLI prompts for buddy fallback details if relay recovery fails, but that buddy-backed fetch path is not implemented yet.
 
 ### Start the Daemon
@@ -214,6 +216,7 @@ buddydrive setup-recovery              Generate recovery phrase and sync encrypt
 buddydrive recover                     Restore config from recovery phrase
 buddydrive sync-config                 Manually sync encrypted config to relay/buddies
 buddydrive export-recovery             Show stored recovery metadata
+buddydrive takeover                    Make this machine the owner of your folders at your buddies
 buddydrive help                        Show help
 ```
 

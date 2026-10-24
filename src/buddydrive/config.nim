@@ -40,6 +40,52 @@ proc getIndexPath*(): string =
 proc getLogPath*(): string =
   result = getDataDir() / LOG_FILE
 
+proc ensureDataDir*()
+
+proc getMachineIdPath*(): string =
+  getDataDir() / "machine-id"
+
+proc machineId*(): string =
+  ## Identifies this installation, as opposed to the buddy identity in
+  ## config.toml, which recovery copies to a new machine. A storage buddy uses
+  ## it to tell two machines claiming to be the same owner apart.
+  let path = getMachineIdPath()
+  if fileExists(path):
+    result = readFile(path).strip()
+    if result.len > 0:
+      return
+  ensureDataDir()
+  result = $genUuid()
+  writeFile(path, result & "\n")
+
+proc getTakeoverPath*(): string =
+  getDataDir() / "takeover-pending"
+
+proc pendingTakeovers*(): seq[string] =
+  ## Buddies this machine still has to claim ownership at, one per line.
+  let path = getTakeoverPath()
+  if not fileExists(path):
+    return
+  for line in readFile(path).splitLines():
+    if line.strip().len > 0:
+      result.add(line.strip())
+
+proc requestTakeover*(buddyIds: seq[string]) =
+  ## This machine replaces the previous owner: at the next successful session
+  ## with each of these buddies, it claims its folders there.
+  ensureDataDir()
+  writeFile(getTakeoverPath(), buddyIds.join("\n") & "\n")
+
+proc clearTakeover*(buddyId: string) =
+  let remaining = pendingTakeovers().filterIt(it != buddyId)
+  if remaining.len == 0:
+    try:
+      removeFile(getTakeoverPath())
+    except OSError:
+      discard
+  else:
+    writeFile(getTakeoverPath(), remaining.join("\n") & "\n")
+
 proc ensureConfigDir*() =
   let dir = getConfigDir()
   if not dir.dirExists():
@@ -93,6 +139,10 @@ proc configToToml*(config: AppConfig, includeHeader = false): string =
   result.add("storage_base_path = \"" & escapeToml(config.storageBasePath) & "\"\n")
   result.add("bandwidth_limit_kbps = " & $config.bandwidthLimitKBps & "\n\n")
 
+  if config.guiLocale.len > 0:
+    result.add("[gui]\n")
+    result.add("locale = \"" & escapeToml(config.guiLocale) & "\"\n\n")
+
   if config.folders.len > 0:
     result.add("[[folders]]\n")
     for i, folder in config.folders:
@@ -122,8 +172,10 @@ proc configToToml*(config: AppConfig, includeHeader = false): string =
       result.add("id = \"" & escapeToml(buddy.id.uuid) & "\"\n")
       result.add("name = \"" & escapeToml(buddy.id.name) & "\"\n")
       result.add("pairing_code = \"" & escapeToml(buddy.pairingCode) & "\"\n")
-      if buddy.syncTime.len > 0:
-        result.add("sync_time = \"" & escapeToml(buddy.syncTime) & "\"\n")
+      if buddy.syncWindow.len > 0:
+        result.add("sync_window = \"" & escapeToml(buddy.syncWindow) & "\"\n")
+      if buddy.syncInterval.len > 0:
+        result.add("sync_interval = \"" & escapeToml(buddy.syncInterval) & "\"\n")
       if buddy.storagePath.len > 0:
         result.add("storage_path = \"" & escapeToml(buddy.storagePath) & "\"\n")
       if buddy.addresses.len > 0:
@@ -157,6 +209,9 @@ proc parseConfigToml*(toml: TomlValueRef): AppConfig =
     result.storageBasePath = toml["network"]{"storage_base_path"}.getStr("")
     result.bandwidthLimitKBps = toml["network"]{"bandwidth_limit_kbps"}.getInt(0)
 
+  if "gui" in toml:
+    result.guiLocale = toml["gui"]{"locale"}.getStr("")
+
   result.folders = @[]
   if "folders" in toml:
     for folderTbl in toml["folders"].getElems():
@@ -180,7 +235,8 @@ proc parseConfigToml*(toml: TomlValueRef): AppConfig =
       buddy.id.uuid = buddyTbl["id"].getStr()
       buddy.id.name = buddyTbl{"name"}.getStr("")
       buddy.pairingCode = buddyTbl{"pairing_code"}.getStr("")
-      buddy.syncTime = buddyTbl{"sync_time"}.getStr("")
+      buddy.syncWindow = buddyTbl{"sync_window"}.getStr(buddyTbl{"sync_time"}.getStr(""))
+      buddy.syncInterval = buddyTbl{"sync_interval"}.getStr("")
       buddy.storagePath = buddyTbl{"storage_path"}.getStr("")
       buddy.addresses = @[]
       if "addresses" in buddyTbl:
@@ -276,14 +332,21 @@ proc ensureFolderIdentities*(config: var AppConfig): seq[string] =
       result.add("folder " & folder.name & " had no id; assigned " & folder.id)
     if not folder.hasUsableKey():
       folder.folderKey = generateKey()
-      result.add("folder " & folder.name & " had no encryption key; generated one" &
-        (if folder.encrypted: ". Files already sent to a buddy from it were not encrypted" else: ""))
+      if folder.encrypted:
+        result.add("folder " & folder.name & " had no encryption key; generated one. " &
+          "Files already sent to a buddy from it were not encrypted")
+      else:
+        result.add("folder " & folder.name & " had no folder key; generated one " &
+          "(unused while the folder is not encrypted)")
 
 proc storageBaseDir*(config: AppConfig): string =
   if config.storageBasePath.len > 0:
     config.storageBasePath
   else:
     getDataDir() / "storage"
+
+proc folderAppliesToBuddy*(folder: FolderConfig, buddyId: string): bool =
+  folder.buddies.len == 0 or buddyId in folder.buddies
 
 proc buddyStorageRoot*(config: AppConfig, buddyId: string): string =
   for buddy in config.buddies:

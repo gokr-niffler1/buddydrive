@@ -1,6 +1,8 @@
 import std/os except FileInfo
 import std/options
 import std/sets
+import std/sequtils
+import std/tables
 import std/times
 import std/base64
 import results
@@ -41,16 +43,28 @@ proc newThrottler*(bytesPerSecond: int): Throttler =
   result.lastTime = Moment.now()
   result.bytesSent = 0
 
+proc legacyIndexKey(folder: FolderConfig): string =
+  folder.name & "|" & folder.path
+
+proc indexKey*(folder: FolderConfig): string =
+  ## What the index keeps a folder's rows under: its stable id and where it
+  ## lives. A rename keeps them, tombstones included. A new location starts
+  ## afresh, so what the buddy stores is restored there rather than taken as
+  ## deleted.
+  if folder.id.len == 0:
+    return legacyIndexKey(folder)
+  folder.id & "|" & normalizedPath(folder.path)
+
 proc newFileTransfer*(folder: FolderConfig, protocol: SyncProtocol): FileTransfer =
   result = FileTransfer()
-  result.index = newIndex(folder.name & "|" & folder.path)
+  result.index = newIndex(indexKey(folder), legacyIndexKey(folder))
   result.scanner = newFileScanner(folder, result.index)
   result.protocol = protocol
   result.throttler = newThrottler(0)
 
 proc newFileTransfer*(folder: FolderConfig, protocol: SyncProtocol, bandwidthLimitKBps: int): FileTransfer =
   result = FileTransfer()
-  result.index = newIndex(folder.name & "|" & folder.path)
+  result.index = newIndex(indexKey(folder), legacyIndexKey(folder))
   result.scanner = newFileScanner(folder, result.index)
   result.protocol = protocol
   result.throttler = newThrottler(bandwidthLimitKBps * 1024)
@@ -89,39 +103,75 @@ proc rebuildIndexFromDisk*(transfer: FileTransfer) =
   ## disappeared are deliberately kept: they are the only evidence that we
   ## once held a path, which is what lets the delta tell a local deletion
   ## apart from a file we have simply never seen. Call
-  ## pruneIndexOfMissingFiles once those deletions have been propagated.
+  ## pruneConfirmedDeletes once those deletions have been propagated.
   for fileInfo in transfer.scanner.scanDirectory():
     transfer.index.addFile(fileInfo, synced = true)
 
-proc pruneIndexOfMissingFiles*(transfer: FileTransfer) =
-  var onDisk: HashSet[string]
-  for fileInfo in transfer.scanner.scanDirectory():
-    onDisk.incl(fileInfo.path)
+proc pruneConfirmedDeletes*(transfer: FileTransfer, buddyId: string, backupBuddies: seq[string]) =
+  ## Called after a successful session with buddyId, which by then has been
+  ## told about every file that is gone from disk. An index row of a deleted
+  ## file is its tombstone: it is what makes the next session send the delete
+  ## instead of restoring the file. It may only go once every buddy the folder
+  ## is backed up to has heard of the delete; otherwise a buddy that has not
+  ## would hand the file back.
+  let onDisk =
+    try:
+      transfer.scanner.scanDirectoryStrict().mapIt(it.path).toHashSet()
+    except CatchableError:
+      return
 
-  for existing in transfer.index.getAllFiles():
-    if existing.path notin onDisk:
-      transfer.index.removeFile(existing.path)
+  # A failed index write stops the pruning. A tombstone kept too long only
+  # sends its delete again; one dropped too early brings the file back.
+  try:
+    let confirmations = transfer.index.deleteConfirmations()
+    for path in confirmations.keys:
+      if path in onDisk:
+        # The file is back; earlier confirmations were for a delete that no
+        # longer applies.
+        transfer.index.clearDeleteConfirmations(path)
 
-proc knownIndexPaths*(transfer: FileTransfer): HashSet[string] =
-  ## Paths this folder has held at some point, according to the index.
-  for existing in transfer.index.getAllFiles():
-    result.incl(existing.path)
+    for existing in transfer.index.getAllFiles():
+      if existing.path in onDisk:
+        continue
+      transfer.index.confirmDelete(existing.path, buddyId)
+      var confirmed =
+        if existing.path in confirmations: confirmations[existing.path]
+        else: initHashSet[string]()
+      confirmed.incl(buddyId)
+      if backupBuddies.allIt(it in confirmed):
+        # Confirmations first: left behind without their tombstone they would
+        # count for a later delete of the same path.
+        transfer.index.clearDeleteConfirmations(existing.path)
+        transfer.index.removeFile(existing.path)
+  except CatchableError:
+    return
+
+proc useEncryptedChunks(transfer: FileTransfer): bool =
+  transfer.scanner.folder.encrypted and transfer.scanner.folder.folderKey.len == KeySize
+
+proc wireHash*(transfer: FileTransfer, hash: array[32, byte]): array[32, byte] =
+  ## A content hash as the storage buddy knows it: keyed with the folder key
+  ## for encrypted folders, as is for plain ones.
+  if transfer.useEncryptedChunks():
+    keyedContentHash(hash, transfer.scanner.folder.folderKey)
+  else:
+    hash
 
 proc verifyRestoredFile(transfer: FileTransfer, path: string, expected: FileInfo): bool =
+  ## The expected hash comes from the storage buddy. Backups made before
+  ## hashes were keyed still hold the plain one, so either is accepted.
   if not fileExists(path) and not symlinkExists(path):
     return false
 
   let actual = transfer.scanner.scanFile(path)
-  if hasExpectedHash(expected) and actual.hash != expected.hash:
+  if hasExpectedHash(expected) and actual.hash != expected.hash and
+      transfer.wireHash(actual.hash) != expected.hash:
     return false
   if expected.symlinkTarget.len > 0 and actual.symlinkTarget != expected.symlinkTarget:
     return false
   if expected.mode != 0 and actual.mode != expected.mode:
     return false
   true
-
-proc useEncryptedChunks(transfer: FileTransfer): bool =
-  transfer.scanner.folder.encrypted and transfer.scanner.folder.folderKey.len == KeySize
 
 proc modeToPermissions(mode: int): set[FilePermission] =
   if (mode and 0o400) != 0:
@@ -144,6 +194,11 @@ proc modeToPermissions(mode: int): set[FilePermission] =
     result.incl(fpOthersExec)
 
 proc applyFileMetadata*(path: string, fileInfo: FileInfo) {.raises: [].} =
+  ## Never through a symlink: both calls would change the link's target,
+  ## which a buddy can point anywhere.
+  if symlinkExists(path):
+    return
+
   if fileInfo.symlinkTarget.len == 0 and fileInfo.mode != 0:
     try:
       setFilePermissions(path, modeToPermissions(fileInfo.mode))
@@ -220,20 +275,27 @@ proc isEncryptedOnWire*(transfer: FileTransfer): bool =
 
 proc ownerFileEntries*(transfer: FileTransfer, files: seq[FileInfo]): seq[FileEntry] =
   ## What the storage buddy gets to see of our files. For encrypted folders
-  ## that is the encrypted path, the content hash, size and metadata; the
-  ## plaintext path is left out and symlink targets are sealed.
+  ## that is the encrypted path, the keyed content hash, size and metadata;
+  ## the plaintext path is left out and symlink targets are sealed.
   for f in files:
     var entry = toFileEntry(f)
     if transfer.useEncryptedChunks():
       entry.path = ""
-      if f.symlinkTarget.len > 0:
-        try:
+      try:
+        entry.hash = hashToString(transfer.wireHash(f.hash))
+        if f.symlinkTarget.len > 0:
           entry.symlinkTarget = encryptSymlinkTarget(f.symlinkTarget, transfer.scanner.folder.folderKey)
-        except CatchableError:
-          continue
+      except CatchableError:
+        continue
     result.add(entry)
 
-proc sendFileList*(transfer: FileTransfer, conn: Connection, files: seq[FileInfo]): Future[bool] {.async.} =
+proc sendFileList*(
+    transfer: FileTransfer,
+    conn: Connection,
+    files: seq[FileInfo],
+    ownerMachine = "",
+    takeover = false,
+): Future[bool] {.async.} =
   let folder = transfer.scanner.folder
   let msg = newFileList(
     folder.name,
@@ -241,6 +303,8 @@ proc sendFileList*(transfer: FileTransfer, conn: Connection, files: seq[FileInfo
     folderWireId(folder),
     transfer.useEncryptedChunks(),
     folder.appendOnly,
+    ownerMachine,
+    takeover,
   )
 
   try:
@@ -391,6 +455,10 @@ proc receiveFileData*(transfer: FileTransfer, conn: Connection, fileInfo: FileIn
   if success:
     try:
       createDir(fullPath.parentDir())
+      # Chunks are written into an existing file without truncating it or
+      # checking for a symlink, so whatever is left at the temp path goes.
+      if symlinkExists(tmpPath) or fileExists(tmpPath):
+        removeFile(tmpPath)
     except CatchableError:
       success = false
 

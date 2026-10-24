@@ -141,6 +141,7 @@ BuddyDrive keeps runtime and file state in SQLite under `~/.buddydrive/`.
 3. It fetches the encrypted config blob from the relay
 4. The config is decrypted and saved locally
 5. Starting the daemon lets normal sync restore missing files
+6. On that sync the new machine becomes the owner of its folders at each buddy; the old machine is refused from then on (`buddydrive takeover` does the same for a config copied by hand)
 
 ## Control API
 
@@ -151,6 +152,8 @@ Local HTTP server (default port 17521) for GUI communication. Localhost connecti
 | GET /status | Runtime status |
 | GET /buddies | Buddy list with connection state |
 | GET /folders | Folder list with sync status |
+| GET /storage | What each buddy stores here |
+| GET /sessions | Recent sync sessions and data transferred |
 | GET /config | Current saved configuration |
 | GET /logs | Recent log entries |
 | GET /recovery | Export recovery metadata |
@@ -159,7 +162,7 @@ Local HTTP server (default port 17521) for GUI communication. Localhost connecti
 | POST /buddies/pair | Pair buddy through the local API |
 | POST /buddies/pairing-code | Generate pairing code |
 | DELETE /buddies/:id | Remove buddy |
-| POST /sync/:folder | Trigger sync |
+| POST /sync/:folder | Sync with the folder's buddies now |
 | POST /config | Update selected config fields |
 | POST /config/reload | Reload config from disk |
 | POST /recovery/setup | Generate recovery phrase |
@@ -174,7 +177,6 @@ Local HTTP server (default port 17521) for GUI communication. Localhost connecti
 ### Current
 
 - Sync uses deterministic initiator selection (CGNAT-correct)
-- One buddy per folder today
 - Buddy-backed config fetch for `recover` is not implemented yet (relay path works)
 - No delta sync for large files (partial-chunk diffs)
 - No selective download

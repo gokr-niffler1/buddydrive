@@ -44,6 +44,7 @@ type
     cmdRecover
     cmdSyncConfig
     cmdExportRecovery
+    cmdTakeover
     cmdHelp
   
   CommandLine* = object
@@ -100,6 +101,8 @@ Commands:
   recover                   Restore from BIP39 mnemonic
   sync-config               Manually sync config to relay/buddies
   export-recovery           Show recovery phrase again
+  takeover                  Make this machine the owner of your folders at
+                            your buddies, replacing another machine
   help                      Show this help
 """
 
@@ -211,6 +214,7 @@ proc parseCli*(): CommandLine =
     of "recover": cmdRecover
     of "sync-config": cmdSyncConfig
     of "export-recovery": cmdExportRecovery
+    of "takeover": cmdTakeover
     of "help": cmdHelp
     else: cmdHelp
   
@@ -224,7 +228,7 @@ proc parseCli*(): CommandLine =
           case result.configKey
           of "api-base-url", "api_base_url", "relay-region", "relay_region", "storage-base-path", "storage_base_path", "bandwidth-limit", "bandwidth_limit":
             result.configValue = args[3]
-          of "buddy-pairing-code", "buddy_pairing_code", "buddy-name", "buddy_name", "buddy-sync-time", "buddy_sync_time", "sync-time", "sync_time", "buddy-storage-path", "buddy_storage_path", "buddy-addresses", "buddy_addresses", "folder-append-only", "folder_append_only":
+          of "buddy-pairing-code", "buddy_pairing_code", "buddy-name", "buddy_name", "buddy-sync-time", "buddy_sync_time", "sync-time", "sync_time", "buddy-sync-window", "buddy_sync_window", "sync-window", "sync_window", "buddy-sync-interval", "buddy_sync_interval", "sync-interval", "sync_interval", "buddy-storage-path", "buddy_storage_path", "buddy-addresses", "buddy_addresses", "folder-append-only", "folder_append_only":
             if args.len >= 5:
               result.configTarget = args[3]
               result.configValue = args[4]
@@ -273,7 +277,8 @@ proc handleInit*() =
   echo "  Announce addr: (set [network].announce_addr after forwarding this port on your router)"
   echo "  Relay base URL: (set with 'buddydrive config set api-base-url <url>')"
   echo "  Relay region: (set with 'buddydrive config set relay-region <region>')"
-  echo "  Buddy sync time: always (set per buddy with 'buddydrive config set buddy-sync-time <buddy-id> HH:MM')"
+  echo "  Buddy sync window: any time (set per buddy with 'buddydrive config set buddy-sync-window <buddy-id> HH:MM-HH:MM')"
+  echo "  Buddy sync interval: 5m until first contact, then 30m (set with 'buddydrive config set buddy-sync-interval <buddy-id> 2h')"
   echo ""
   echo "Next steps:"
   echo "  1. Add a folder: buddydrive add-folder <path> --name <name>"
@@ -317,20 +322,35 @@ proc handleConfig*(cmd: CommandLine) =
         let mbps = (kbps * 8) div 1000
         echo "Bandwidth limit set to: ", kbps, " KB/s (", mbps, " Mbps)"
       return
-    of "buddy-sync-time", "buddy_sync_time", "sync-time", "sync_time":
+    of "buddy-sync-time", "buddy_sync_time", "sync-time", "sync_time", "buddy-sync-window", "buddy_sync_window", "sync-window", "sync_window":
       let idx = cfg.getBuddy(cmd.configTarget)
       if idx < 0:
         echo "Buddy not found: ", cmd.configTarget.shortId()
         return
       if cmd.configValue.toLowerAscii() == "off":
-        cfg.buddies[idx].syncTime = ""
+        cfg.buddies[idx].syncWindow = ""
       else:
-        if parseClockMinutes(cmd.configValue) < 0:
-          echo "Invalid sync time. Use HH:MM or 'off'."
+        if not parseSyncWindow(cmd.configValue).ok:
+          echo "Invalid sync window. Use HH:MM-HH:MM or 'off'."
           return
-        cfg.buddies[idx].syncTime = cmd.configValue
+        cfg.buddies[idx].syncWindow = cmd.configValue.strip()
       saveConfig(cfg)
-      echo "Sync time for buddy ", cfg.buddies[idx].id.uuid.shortId(), " set to: ", syncTimeDescription(cfg.buddies[idx].syncTime)
+      echo "Sync window for buddy ", cfg.buddies[idx].id.uuid.shortId(), " set to: ", syncWindowDescription(cfg.buddies[idx].syncWindow)
+      return
+    of "buddy-sync-interval", "buddy_sync_interval", "sync-interval", "sync_interval":
+      let idx = cfg.getBuddy(cmd.configTarget)
+      if idx < 0:
+        echo "Buddy not found: ", cmd.configTarget.shortId()
+        return
+      if cmd.configValue.toLowerAscii() == "off":
+        cfg.buddies[idx].syncInterval = ""
+      else:
+        if parseSyncInterval(cmd.configValue) <= 0:
+          echo "Invalid sync interval. Use for example 30m, 2h or 1h30m, or 'off'."
+          return
+        cfg.buddies[idx].syncInterval = cmd.configValue.strip()
+      saveConfig(cfg)
+      echo "Sync interval for buddy ", cfg.buddies[idx].id.uuid.shortId(), " set to: ", syncIntervalDescription(cfg.buddies[idx].syncInterval)
       return
     of "buddy-pairing-code", "buddy_pairing_code", "pairing-code", "pairing_code":
       let idx = cfg.getBuddy(cmd.configTarget)
@@ -398,7 +418,7 @@ proc handleConfig*(cmd: CommandLine) =
       return
     else:
       echo "Unknown config key: ", cmd.configKey
-      echo "Supported keys: api-base-url, relay-region, storage-base-path, bandwidth-limit, buddy-pairing-code, buddy-name, buddy-sync-time, buddy-storage-path, buddy-addresses, folder-append-only"
+      echo "Supported keys: api-base-url, relay-region, storage-base-path, bandwidth-limit, buddy-pairing-code, buddy-name, buddy-sync-window, buddy-sync-interval, buddy-storage-path, buddy-addresses, folder-append-only"
       return
 
   let cfg = loadConfig()
@@ -448,7 +468,8 @@ proc handleConfig*(cmd: CommandLine) =
       echo "    ID: ", buddy.id.uuid
       if buddy.pairingCode.len > 0:
         echo "    Pairing code: ", buddy.pairingCode
-      echo "    Sync time: ", syncTimeDescription(buddy.syncTime)
+      echo "    Sync window: ", syncWindowDescription(buddy.syncWindow)
+      echo "    Sync interval: ", syncIntervalDescription(buddy.syncInterval)
       echo "    Added: ", buddy.addedAt.format("yyyy-MM-dd HH:mm:ss")
   else:
     echo "No buddies paired yet."
@@ -756,7 +777,8 @@ proc handleStatus*() =
     echo "Buddies:"
     for buddy in cfg.buddies:
       echo "  ", buddy.id.name, " (", buddy.id.uuid.shortId(), ")"
-      echo "    Sync time: ", syncTimeDescription(buddy.syncTime)
+      echo "    Sync window: ", syncWindowDescription(buddy.syncWindow)
+      echo "    Sync interval: ", syncIntervalDescription(buddy.syncInterval)
       echo "    Status: Offline"
       if buddy.pairingCode.len > 0:
         echo "    Pairing code: ", buddy.pairingCode
@@ -863,6 +885,7 @@ proc handleRecover*() =
   if configOpt.isSome:
     let cfg = configOpt.get()
     saveConfig(cfg)
+    requestTakeover(cfg.buddies.mapIt(it.id.uuid))
     echo ""
     echo "Recovery successful!"
     echo ""
@@ -870,7 +893,9 @@ proc handleRecover*() =
     echo "Buddies: ", cfg.buddies.len
     echo "Folders: ", cfg.folders.len
     echo ""
-    echo "Run 'buddydrive start' to sync your folders."
+    echo "Run 'buddydrive start' to sync your folders. This machine takes over"
+    echo "your folders at each buddy on its first sync with it; the old machine"
+    echo "is refused from then on."
   else:
     echo ""
     echo "Could not recover from relay (see the reason above)."
@@ -912,6 +937,21 @@ proc handleSyncConfig*() =
   
   if cfg.buddies.len > 0:
     echo "Buddy config sync is not implemented yet."
+
+proc handleTakeover*() =
+  ## For when this machine replaces another one with the same identity, but
+  ## the config did not come from 'recover' (copied by hand, restored from a
+  ## backup).
+  if not config.configExists():
+    echo "No config found. Run 'buddydrive init' first."
+    return
+  let cfg = loadConfig()
+  if cfg.buddies.len == 0:
+    echo "No buddies configured; nothing to take over."
+    return
+  requestTakeover(cfg.buddies.mapIt(it.id.uuid))
+  echo "This machine will take over your folders at ", cfg.buddies.len, " buddies on its next sync with each."
+  echo "Only do this if the other machine is retired: from then on it is refused."
 
 proc handleExportRecovery*() =
   if not config.configExists():

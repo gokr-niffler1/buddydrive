@@ -106,7 +106,7 @@ src/
         ├── transfer.nim        # Chunked file transfer (64KB, LZ4 compression)
         ├── session.nim         # Sync sessions (owner round + storage round per buddy)
         ├── storage.nim         # Storage side: a buddy's folders kept on our disk
-        ├── policy.nim          # Sync policy (sync window, append-only, shouldSyncRemoteFile)
+        ├── policy.nim          # Per-buddy sync time window
         └── config_sync.nim     # Config sync to relay/buddies, recovery logic
 ```
 
@@ -152,7 +152,7 @@ tests/
 
 - Default P2P port: `41721` (defined in `types.nim`)
 - Default control port: `17521` (defined in `control.nim`)
-- Discovery interval: 10 minutes (`BuddyDiscoveryInterval` in `daemon.nim`)
+- Scheduler tick: 1 minute (`BuddyScheduleTick` in `daemon.nim`); each buddy is dialed per its own sync interval (default 5m until first contact, then 30m; `policy.nim`)
 - Discovery record TTL: 6h (server-side), re-published every 4h
 - File chunk size: 64KB
 - Transfer files use LZ4 compression when it reduces size
@@ -172,7 +172,7 @@ tests/
 - Chronos async procs enforce GC-safety — non-GC-safe calls (e.g., `parsetoml.parseFile`) must be wrapped with `{.cast(gcsafe).}:`
 - Chronos async procs enforce exception tracking — calls that can raise `SodiumError` must be wrapped in `try/except`
 - The control server runs synchronous HTTP in a dedicated thread
-- SQLite access via `db_connector/db_sqlite` (bundled with Nim 2.2.8+)
+- SQLite access via `db_connector/db_sqlite` (bundled with Nim 2.2.8+). Both databases set `PRAGMA busy_timeout = 5000`: the control thread reads `state.db` while the daemon writes it
 - Chronos async requires `{.cast(gcsafe).}` for cross-thread calls
 
 ### Encryption
@@ -196,24 +196,29 @@ The new sync model is now **largely implemented**. See `docs/PLAN.md` for the fu
 - **Encrypted backup model**: files stored encrypted on buddy's machine (filenames + content). Buddy is storage, not co-author. Sync is never a mirror between same-named folders.
 - **Per-buddy storage root**: `[[buddies]] storage_path`, else `<storage_base_path or ~/.buddydrive/storage>/<buddy-uuid>`. Each shared folder lives in `<root>/<folder-id>/` (see `buddyStorageRoot` in `config.nim`, `sync/storage.nim`).
 - **Opaque blobs**: encrypted folders are stored as `<hh>/<hash>.blob` (sealed chunk frames as sent) plus a `.meta` JSON sidecar. Unencrypted folders are stored as plain files.
-- **Paths from a buddy go through `safeJoin`** (`scanner.nim`) before touching disk.
-- **Per-buddy sync_time**: replaces global sync window. Controls when to initiate, not when to accept.
+- **Paths from a buddy go through `safeJoin`** (`scanner.nim`) before touching disk. It also refuses `.buddytmp` names, and `applyFileMetadata` never follows a symlink: in unencrypted storage a buddy's symlink is a real link.
+- **Per-buddy sync_window + sync_interval**: `sync_window = "HH:MM-HH:MM"` (empty = any time; legacy `sync_time = "HH:MM"` is read as ±15 min) and `sync_interval = "30m"/"2h"` (empty = 5m until first contact, then 30m). Control when to initiate, not when to accept. A buddy that dials us is still looked up every 10 min (`RelayStandbyMinutes`) so relay rendezvous keeps working.
+- **Build ID**: `version.nim` takes the version from `buddydrive.nimble` and the git commit (`-dirty` if modified) at compile time; set `-d:buildCommit=<id>` where there is no git checkout. Printed at daemon start and returned by `GET /status` as `build`, with the wire protocol version.
+- **GUI locale**: `[gui] locale` (BCP 47, e.g. `sv-SE`; empty = browser's) set in the web GUI Settings. The API always sends UTC ISO 8601; `app.js` formats dates, sizes, counts and relative times with `Intl` in that locale (`makeFormatters`).
+- **GUI sync requests**: `POST /sync` (all) and `POST /sync/<folder>` queue a request; the daemon's progress per buddy (`SyncRequestState`) is written to `state.db` `sync_requests` and returned by `GET /sessions` as `requests`.
 - **Always accept incoming**: sync time controls initiation only. Incoming connections from known buddies are always accepted.
 - **Deterministic initiator**: CGNAT side initiates (dials the public side). If both public, lower UUID initiates.
 - **Streaming blake2b hash**: `crypto_generichash_init/update/final` — 64KB chunks, never full file in memory.
 - **Deterministic path encryption**: same path → same encrypted path. Enables move detection.
 - **Random content nonces**: each chunk encrypted with random nonce (prepended). Same file encrypted twice produces different ciphertext — prevents nonce reuse.
-- **Content-hash-based sync**: owner sends plaintext blake2b hash to storage buddy. Detects changes, moves, and deletes.
+- **Content-hash-based sync**: owner sends its blake2b content hash to the storage buddy, keyed with the folder key for encrypted folders (`keyedContentHash`, `wireHash` in `transfer.nim`) so the buddy cannot match it against known files. Detects changes, moves, and deletes. Older backups with plain hashes are rekeyed in place with `msgRehash`, not re-sent.
 - **Owner-authoritative moves**: A tells B "rename X to Y". B does not infer moves from ciphertext identity.
 - **Delete propagation**: `msgFileDelete` is sent and handled.
 - **Hash verification on restore**: `verifyRestoredFile` re-scans and checks hash after write.
 - **SQLite index is cache**: both sides maintain indexes for performance, but restore only needs the folder key + buddy's filesystem.
+- **Index rows are keyed by folder id + normalized path** (`indexKey` in `transfer.nim`), so a rename keeps a folder's tombstones and a new path starts afresh (stored files are restored there, not deleted). Rows under the old `name|path` key are taken over on first use. Writes that deletes depend on (`cacheScannedFile`, delete confirmations, `removeFile`) raise instead of failing silently.
 - **Restore flow**: recover config from relay → connect to buddy → list encrypted paths → decrypt paths → request missing files → verify hashes → rebuild index
 - **Discovery records are per buddy**: key = pairing code + publishing buddy's id; writes carry a stable owner token so a restarted buddy can replace its record (needs the matching buddydrive-relay).
 - **Discovery publishes public addresses only** (plus `announce_addr`). LAN buddies are reached via per-buddy `addresses` in config, dialed first.
 - **Pairing codes** come from libsodium's CSPRNG (`generatePairingCode` in `crypto.nim`), never `std/random`.
 - **Create folders with `newSyncFolder`** (`config.nim`), never bare `newFolderConfig`: it sets the stable id and the folder key. An encrypted folder without a key is skipped by sync, and the daemon repairs such folders at startup (`ensureFolderIdentities`).
-- **Wire protocol version 5** (`ProtocolVersion` in `messages.nim`): older peers are rejected at the handshake.
+- **One owning machine per stored folder**: owners send `config.machineId()` (data dir, not config.toml); the storage side records it in `<buddy root>/<folder dir>.owner` and answers another machine with `msgFolderRefused`, unless it takes over (`requestTakeover`, set by `recover` and `buddydrive takeover`, cleared per buddy after a successful session).
+- **Wire protocol version 7** (`ProtocolVersion` in `messages.nim`): older peers are rejected at the handshake.
 
 ### Remaining Work
 
@@ -223,6 +228,22 @@ The new sync model is now **largely implemented**. See `docs/PLAN.md` for the fu
 - **Long-lived CGNAT connections**: keepalive and prompt redial — not yet implemented.
 - **`init --with-recovery`**: parsed as CLI flag but does nothing. Use `init` then `setup-recovery`.
 - **Large folder listings**: file list exchange uses a single framed message (30MB max). Pagination or streaming deferred.
+- **Blocking discovery HTTP**: `publishBuddy`, `findBuddy` and `unpublishBuddy` (`discovery.nim`) call curly synchronously from async code, so an unreachable API stalls the chronos loop for up to 30 s per call. They belong on a worker thread.
+
+### Minor Known Issues
+
+Smaller leftovers from the code review of the multi-buddy-ownership branch. None of them changes the backup model's guarantees; each is a bounded cleanup.
+
+- **`sendBlob` can abort mid-stream without an ack** (`sync/storage.nim`): when a frame fails after earlier frames were already sent, it returns false without sending `msgFileAck`, so the owner waits for the 5-minute idle timeout instead of failing fast. Send `newFileAck(false)` on that path, as `receiveBlob` already does.
+- **`takeSyncRequests` can leave a `.taken` file** (`control.nim`): if the process stops between `moveFile` and `removeFile`, that file is never read again (the next request still lands in the original path). Clean stale `.taken` files up on startup, or read the requests without the rename.
+- **`addFile` still fails silently** (`sync/index.nim`): it uses `tryExec`/`discard`, unlike the other delete-critical writes (`cacheScannedFile`, `removeFile`, `confirmDelete`, `clearDeleteConfirmations`). A dropped row self-heals on the next scan, but make it raise for consistency.
+- **Legacy index adoption only matches the folder's current name** (`indexKey`/`legacyIndexKey` in `sync/transfer.nim`): a folder renamed on an older build before upgrading keeps its rows under `oldname|path` and they are never adopted, so its old tombstones are orphaned. Rare; only the new key's `name|path` form is looked for.
+- **`writeLiveStatus` has no explicit rollback** (`control.nim`): if a statement fails mid-transaction it relies on the connection closing to roll back, unlike `adoptLegacyRows` (`sync/index.nim`), which rolls back itself. Wrap it in `try/except` with `ROLLBACK` for the same guarantee.
+- **Restored symlink metadata is not verified consistently** (`sync/transfer.nim`): `applyFileMetadata` deliberately skips symlinks, but `verifyRestoredFile` still compares `expected.mode` for them; on a platform whose link permissions differ that could fail verification. Skip the mode check when `symlinkTarget` is set.
+- **An empty machine id bypasses the one-owner rule** (`sync/storage.nim`): `decideOwnership` accepts a listing whose `ownerMachine` is empty, so a peer whose id cannot be read has no ownership protection. The daemon now logs when its own id is unreadable; consider refusing instead.
+- **`saveConfig` races between the daemon and the control thread** (`config.nim`, `control.nim`, `daemon.nim`): both write `config.toml` through the same atomic temp-file + rename, so the file never tears, but a concurrent reload/save can still lose one side's update. Serialize config writes (a lock, or make the daemon the only writer).
+- **`connect` and `--daemon` are no-ops** (`cli.nim`): both are still advertised in the help text and in `init`'s output but only print "not implemented" (or are ignored). Implement them or remove them from the docs and CLI.
+- **`version.nim` claims `BuildTime` is UTC**: the comment says so, but Nim's `CompileTime` is local time. Convert it to UTC or fix the comment.
 
 ### HTTP Client (curly)
 

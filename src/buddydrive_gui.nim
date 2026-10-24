@@ -1,6 +1,6 @@
-import std/[os, json, httpclient, options, osproc, strutils, times]
+import std/[os, json, httpclient, options, osproc, strutils, times, uri]
 import chronos
-import buddydrive/[cli, config as buddyconfig, control, recovery, sync/config_sync, types]
+import buddydrive/[cli, config as buddyconfig, control, recovery, sync/config_sync, sync/policy, types]
 
 {.passl: gorge("pkg-config --libs gtk4").}
 
@@ -213,7 +213,8 @@ proc localConfigJson(): JsonNode =
       "id": buddy.id.uuid,
       "name": buddy.id.name,
       "pairing_code": buddy.pairingCode,
-      "sync_time": buddy.syncTime,
+      "sync_window": buddy.syncWindow,
+      "sync_interval": buddy.syncInterval,
       "addedAt": buddy.addedAt.utc.format("yyyy-MM-dd'T'HH:mm:ss'Z'")
     })
   %*{
@@ -248,7 +249,9 @@ proc localFoldersJson(): JsonNode =
         "syncedBytes": 0,
         "fileCount": 0,
         "syncedFiles": 0,
-        "status": "idle"
+        "status": "idle",
+        "detail": "",
+        "lastSync": ""
       }
     })
   %*{"folders": folders}
@@ -261,7 +264,8 @@ proc localBuddiesJson(): JsonNode =
       "id": buddy{"id"}.getStr(""),
       "name": buddy{"name"}.getStr(""),
       "pairingCode": buddy{"pairing_code"}.getStr(""),
-      "syncTime": buddy{"sync_time"}.getStr(""),
+      "syncWindow": buddy{"sync_window"}.getStr(""),
+      "syncInterval": buddy{"sync_interval"}.getStr(""),
       "state": "disconnected",
       "latencyMs": -1,
       "lastSync": buddy{"addedAt"}.getStr("")
@@ -297,7 +301,7 @@ proc updateFolderConfig(originalName, newName, newPath: string, encrypted, appen
   saveConfigAndRefresh(cfg)
   true
 
-proc updateBuddyConfig(originalId, name, pairingCode, syncTime: string): bool =
+proc updateBuddyConfig(originalId, name, pairingCode, syncWindow, syncInterval: string): bool =
   if not buddyconfig.configExists():
     return false
   var cfg = currentConfig()
@@ -306,7 +310,8 @@ proc updateBuddyConfig(originalId, name, pairingCode, syncTime: string): bool =
     return false
   cfg.buddies[idx].id.name = name
   cfg.buddies[idx].pairingCode = pairingCode
-  cfg.buddies[idx].syncTime = syncTime
+  cfg.buddies[idx].syncWindow = syncWindow
+  cfg.buddies[idx].syncInterval = syncInterval
   saveConfigAndRefresh(cfg)
   true
 
@@ -325,7 +330,7 @@ proc removeBuddyLocal(id: string): bool =
   discard refreshUI(nil)
 
 proc showAddFolderDialog(originalName, currentName, currentPath: string, encrypted, appendOnly: bool, buddies: seq[string])
-proc showPairBuddyDialog(originalId, buddyId, buddyName, code, syncTime: string)
+proc showPairBuddyDialog(originalId, buddyId, buddyName, code, syncWindow, syncInterval: string)
 
 proc formatBytes(bytes: int64): string =
   if bytes < 1024:
@@ -337,11 +342,37 @@ proc formatBytes(bytes: int64): string =
   else:
     $(bytes div (1024 * 1024 * 1024)) & " GB"
 
+proc folderStatusText(status: JsonNode): string =
+  let syncStatus = status{"status"}.getStr("idle")
+  var parts = @[
+    case syncStatus
+    of "idle": "Not synced yet"
+    of "syncing": "Syncing"
+    of "synced": "Synced"
+    of "skipped": "Skipped"
+    of "refused": "Refused"
+    of "failed": "Sync did not finish"
+    else: syncStatus
+  ]
+  let lastSync = status{"lastSync"}.getStr("")
+  if lastSync.len > 0:
+    try:
+      parts.add("last synced " & parse(lastSync, "yyyy-MM-dd'T'HH:mm:ss'Z'", utc()).local.format("yyyy-MM-dd HH:mm"))
+    except CatchableError:
+      parts.add("last synced " & lastSync)
+  let totalBytes = status{"totalBytes"}.getInt(0)
+  if totalBytes > 0:
+    parts.add(formatBytes(status{"syncedBytes"}.getInt(0)) & " / " & formatBytes(totalBytes) & " (" & $status{"fileCount"}.getInt(0) & " files)")
+  parts.join(" · ")
+
 proc onFolderSyncClick(btn: GtkButton, userData: pointer) {.cdecl.} =
   let folderName = readSharedString(userData)
   if folderName.len > 0 and state.controlAvailable:
-    discard apiPost("/sync/" & folderName)
-    setMessage("Sync requested for folder '" & folderName & "'.")
+    let resp = apiPost("/sync/" & encodeUrl(folderName, usePlus = false))
+    if resp.hasKey("error"):
+      setMessage("Could not request a sync of '" & folderName & "': " & resp{"error"}.getStr())
+    else:
+      setMessage("Sync requested for folder '" & folderName & "'.")
   else:
     setMessage("Daemon is not running; cannot trigger sync.")
   deallocShared(userData)
@@ -369,7 +400,7 @@ proc onBuddyEditClick(btn: GtkButton, userData: pointer) {.cdecl.} =
   let idx = cfg.getBuddy(buddyId)
   if idx >= 0:
     let buddy = cfg.buddies[idx]
-    showPairBuddyDialog(buddy.id.uuid, buddy.id.uuid, buddy.id.name, buddy.pairingCode, buddy.syncTime)
+    showPairBuddyDialog(buddy.id.uuid, buddy.id.uuid, buddy.id.name, buddy.pairingCode, buddy.syncWindow, buddy.syncInterval)
   deallocShared(userData)
 
 proc onBuddyRemoveClick(btn: GtkButton, userData: pointer) {.cdecl.} =
@@ -424,13 +455,24 @@ proc createFolderRow(folder: JsonNode): GtkBox =
   let appendOnly = folder{"appendOnly"}.getBool(folder{"append_only"}.getBool(false))
   let totalBytes = status{"totalBytes"}.getInt(0)
   let syncedBytes = status{"syncedBytes"}.getInt(0)
-  let fileCount = status{"fileCount"}.getInt(0)
   let syncStatus = status{"status"}.getStr("idle")
-  
-  let statusText = syncStatus & " - " & formatBytes(syncedBytes) & " / " & formatBytes(totalBytes) & " (" & $fileCount & " files)"
-  let statusLabel = gtkLabelNew(cstring(statusText))
+  let problem = syncStatus in ["skipped", "refused", "failed"]
+
+  let statusLabel = gtkLabelNew(cstring(folderStatusText(status)))
   gtkWidgetAddCssClass(statusLabel, "caption")
+  if problem:
+    gtkWidgetAddCssClass(statusLabel, "error")
+  elif syncStatus == "synced":
+    gtkWidgetAddCssClass(statusLabel, "success")
   gtkBoxAppend(leftBox, statusLabel)
+
+  let detail = status{"detail"}.getStr("")
+  if problem and detail.len > 0:
+    let detailLabel = gtkLabelNew(cstring(detail))
+    gtkLabelSetWrap(detailLabel, 1)
+    gtkWidgetAddCssClass(detailLabel, "caption")
+    gtkWidgetAddCssClass(detailLabel, "error")
+    gtkBoxAppend(leftBox, detailLabel)
 
   let detailsLabel = gtkLabelNew(cstring("Encrypted: " & $folder{"encrypted"}.getBool(true) & " | Append-only: " & $appendOnly))
   gtkWidgetAddCssClass(detailsLabel, "caption")
@@ -453,7 +495,7 @@ proc createFolderRow(folder: JsonNode): GtkBox =
   discard gSignalConnect(cast[GObject](removeBtn), "clicked", cast[GCallback](onFolderRemoveClick), folderNameData3)
   gtkBoxAppend(row, actions)
   
-  if syncStatus == "syncing":
+  if syncStatus == "syncing" and totalBytes > 0:
     let progress = gtkProgressBarNew()
     let fraction = if totalBytes > 0: syncedBytes.float / totalBytes.float else: 0.0
     gtkProgressBarSetFraction(progress, fraction.cdouble)
@@ -489,10 +531,13 @@ proc createBuddyRow(buddy: JsonNode): GtkBox =
   gtkBoxAppend(leftBox, idLabel)
 
   let pairingCode = buddy{"pairingCode"}.getStr(buddy{"pairing_code"}.getStr(""))
-  let syncTime = buddy{"syncTime"}.getStr(buddy{"sync_time"}.getStr(""))
+  let syncWindow = buddy{"syncWindow"}.getStr("")
+  let syncInterval = buddy{"syncInterval"}.getStr("")
   let detailsText =
-    if pairingCode.len > 0 or syncTime.len > 0:
-      "Code: " & pairingCode & (if syncTime.len > 0: " | Sync time: " & syncTime else: "")
+    if pairingCode.len > 0 or syncWindow.len > 0 or syncInterval.len > 0:
+      "Code: " & pairingCode &
+        (if syncWindow.len > 0: " | Sync window: " & syncWindow else: "") &
+        (if syncInterval.len > 0: " | Every " & syncInterval else: "")
     else:
       ""
   if detailsText.len > 0:
@@ -614,7 +659,8 @@ type
     idEntry: pointer
     nameEntry: pointer
     codeEntry: pointer
-    syncTimeEntry: pointer
+    syncWindowEntry: pointer
+    syncIntervalEntry: pointer
     originalId: string
    
   SettingsData = object
@@ -667,16 +713,21 @@ proc onPairBuddyResponse(w: GtkWindow, responseId: cint, userData: pointer) {.cd
     let buddyId = $gtkEditableGetText(data.idEntry)
     let buddyName = $gtkEditableGetText(data.nameEntry)
     let code = $gtkEditableGetText(data.codeEntry)
-    let syncTime = $gtkEditableGetText(data.syncTimeEntry)
+    let syncWindow = ($gtkEditableGetText(data.syncWindowEntry)).strip()
+    let syncInterval = ($gtkEditableGetText(data.syncIntervalEntry)).strip()
+    let scheduleOk = isValidSyncWindow(syncWindow) and isValidSyncInterval(syncInterval)
 
-    if data.originalId.len > 0:
-      discard updateBuddyConfig(data.originalId, buddyName, code, syncTime)
+    if not scheduleOk or buddyName.strip().len == 0:
+      discard
+    elif data.originalId.len > 0:
+      discard updateBuddyConfig(data.originalId, buddyName, code, syncWindow, syncInterval)
     elif buddyId.len > 0 and code.len > 0:
       var cfg = currentConfig()
       var buddy: BuddyInfo
       buddy.id = newBuddyId(buddyId, buddyName)
       buddy.pairingCode = code
-      buddy.syncTime = syncTime
+      buddy.syncWindow = syncWindow
+      buddy.syncInterval = syncInterval
       buddy.addedAt = getTime()
       cfg.addBuddy(buddy)
       discard refreshUI(nil)
@@ -802,12 +853,12 @@ proc showAddFolderDialog(originalName, currentName, currentPath: string, encrypt
   gtkWidgetGrabFocus(nameEntry)
 
 proc showPairBuddyDialog() =
-  showPairBuddyDialog("", "", "", "", "")
+  showPairBuddyDialog("", "", "", "", "", "")
 
 proc onGenerateCodeClick(btn: GtkButton, userData: pointer) {.cdecl.} =
   gtkEditableSetText(userData, generatePairingCode().cstring)
 
-proc showPairBuddyDialog(originalId, buddyId, buddyName, code, syncTime: string) =
+proc showPairBuddyDialog(originalId, buddyId, buddyName, code, syncWindow, syncInterval: string) =
   let dialog = gtkDialogNew()
   gtkWindowSetTitle(dialog, cstring(if originalId.len == 0: "Pair with Buddy" else: "Edit Buddy"))
   gtkWindowSetModal(dialog, 1)
@@ -837,7 +888,7 @@ proc showPairBuddyDialog(originalId, buddyId, buddyName, code, syncTime: string)
   gtkWidgetSetMarginBottom(idEntry, 8)
   gtkBoxAppend(content, idEntry)
   
-  let nameLabel = gtkLabelNew("Buddy name (optional):")
+  let nameLabel = gtkLabelNew("Buddy name:")
   gtkBoxAppend(content, nameLabel)
   
   let nameEntry = gtkEntryNew()
@@ -871,21 +922,32 @@ proc showPairBuddyDialog(originalId, buddyId, buddyName, code, syncTime: string)
   gtkWidgetSetMarginBottom(codeHint, 8)
   gtkBoxAppend(content, codeHint)
 
-  let syncTimeLabel = gtkLabelNew("Sync time (optional, HH:MM):")
-  gtkBoxAppend(content, syncTimeLabel)
+  let syncWindowLabel = gtkLabelNew("Sync window (HH:MM-HH:MM, empty = any time):")
+  gtkBoxAppend(content, syncWindowLabel)
 
-  let syncTimeEntry = gtkEntryNew()
-  gtkEntrySetPlaceholderText(syncTimeEntry, "03:00")
-  if syncTime.len > 0:
-    gtkEditableSetText(syncTimeEntry, syncTime.cstring)
-  gtkBoxAppend(content, syncTimeEntry)
+  let syncWindowEntry = gtkEntryNew()
+  gtkEntrySetPlaceholderText(syncWindowEntry, "22:00-06:00")
+  if syncWindow.len > 0:
+    gtkEditableSetText(syncWindowEntry, syncWindow.cstring)
+  gtkWidgetSetMarginBottom(syncWindowEntry, 8)
+  gtkBoxAppend(content, syncWindowEntry)
+
+  let syncIntervalLabel = gtkLabelNew("Sync interval (e.g. 30m or 2h, empty = default):")
+  gtkBoxAppend(content, syncIntervalLabel)
+
+  let syncIntervalEntry = gtkEntryNew()
+  gtkEntrySetPlaceholderText(syncIntervalEntry, "30m")
+  if syncInterval.len > 0:
+    gtkEditableSetText(syncIntervalEntry, syncInterval.cstring)
+  gtkBoxAppend(content, syncIntervalEntry)
   
   let data = cast[ptr PairBuddyData](allocShared0(sizeof(PairBuddyData)))
   data.dialog = dialog
   data.idEntry = idEntry
   data.nameEntry = nameEntry
   data.codeEntry = codeEntry
-  data.syncTimeEntry = syncTimeEntry
+  data.syncWindowEntry = syncWindowEntry
+  data.syncIntervalEntry = syncIntervalEntry
   data.originalId = originalId
   
   discard gSignalConnect(cast[GObject](dialog), "response", cast[GCallback](onPairBuddyResponse), cast[pointer](data))
@@ -1417,7 +1479,7 @@ proc createMainWindow(app: GtkApplication): GtkWindow =
     for folder in foldersJson{"folders"}.getElems():
       let name = folder{"name"}.getStr("")
       if name.len > 0:
-        discard apiPost("/sync/" & name)
+        discard apiPost("/sync/" & encodeUrl(name, usePlus = false))
   
   discard gSignalConnect(cast[GObject](syncAllBtn), "clicked", cast[GCallback](onSyncAllClick), nil)
   

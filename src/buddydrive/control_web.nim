@@ -39,6 +39,17 @@ proc stripSecretPrefix(path: string, secret: string): string =
     return "/"
   ""
 
+proc lanRootRedirect*(raw: string, buddyUuid: string): string =
+  ## The page loads its assets by relative path, so /w/<secret> must become
+  ## /w/<secret>/ or they resolve outside the secret prefix.
+  let location = "/w/" & webSecret(buddyUuid)
+  if extractPath(raw) != location:
+    return ""
+  "HTTP/1.1 301 Moved Permanently\r\n" &
+    "Location: " & location & "/\r\n" &
+    "Content-Length: 0\r\n" &
+    "Connection: close\r\n\r\n"
+
 proc rewriteLanRequest*(raw: string, buddyUuid: string): string =
   let secret = webSecret(buddyUuid)
   let path = extractPath(raw)

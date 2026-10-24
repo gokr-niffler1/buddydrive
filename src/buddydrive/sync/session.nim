@@ -4,6 +4,7 @@ import chronos
 import libp2p/stream/connection
 import ../types
 import ../crypto
+import ../config
 import ../p2p/messages
 import ../p2p/protocol
 import transfer
@@ -19,8 +20,11 @@ import ../logutils
 ## needs. After the owner lists are exchanged, the folders of the buddy with
 ## the lower UUID are handled first, then those of the other.
 
-proc folderAppliesToBuddy(folder: FolderConfig, buddyId: string): bool =
-  folder.buddies.len == 0 or buddyId in folder.buddies
+proc backupBuddies(config: AppConfig, folder: FolderConfig): seq[string] =
+  ## Every configured buddy this folder is backed up to.
+  for buddy in config.buddies:
+    if folderAppliesToBuddy(folder, buddy.id.uuid):
+      result.add(buddy.id.uuid)
 
 proc applicableFolders(config: AppConfig, buddyId: string): seq[FolderConfig] =
   ## An encrypted folder without a usable key is left out rather than sent in
@@ -50,9 +54,25 @@ const
   SessionEndLingerTimeout = chronos.seconds(2)
 
 type
+  FolderOutcome* = enum
+    foSynced
+    foSkipped
+    foRefused
+
+  FolderReport* = object
+    folderName*: string
+    outcome*: FolderOutcome
+    reason*: string
+
+  SessionReport* = ref object
+    ## What became of each of our folders in one session, for the GUIs.
+    ## Folders not listed did not get their turn: the session ended first.
+    folders*: seq[FolderReport]
+
   OwnedFolder = object
     transfer: FileTransfer
     files: seq[FileInfo]
+    backupBuddies: seq[string]
 
   MoveInstruction = tuple[oldPath: string, newPath: string, hash: string]
 
@@ -61,9 +81,19 @@ type
     deletes: seq[string]
     restores: seq[FileInfo]
 
-proc sendOwnerLists(owned: seq[OwnedFolder], conn: Connection, protocol: SyncProtocol): Future[bool] {.async.} =
+proc note(report: SessionReport, folderName: string, outcome: FolderOutcome, reason = "") =
+  if report != nil:
+    report.folders.add(FolderReport(folderName: folderName, outcome: outcome, reason: reason))
+
+proc sendOwnerLists(
+    owned: seq[OwnedFolder],
+    conn: Connection,
+    protocol: SyncProtocol,
+    ownerMachine: string,
+    takeover: bool,
+): Future[bool] {.async.} =
   for folder in owned:
-    if not await folder.transfer.sendFileList(conn, folder.files):
+    if not await folder.transfer.sendFileList(conn, folder.files, ownerMachine, takeover):
       return sessionFailed("could not send the file list of " & folder.transfer.scanner.folder.name)
   try:
     await protocol.sendMessage(conn, newSyncDone())
@@ -113,6 +143,28 @@ proc readableStored(transfer: FileTransfer, stored: seq[FileInfo]): seq[FileInfo
     else:
       info.path = entry.encryptedPath
     result.add(info)
+
+proc wireView(transfer: FileTransfer, files: seq[FileInfo]): seq[FileInfo] =
+  ## Our files with their content hashes as the storage buddy knows them, so
+  ## the two lists can be compared.
+  for info in files:
+    var wired = info
+    wired.hash = transfer.wireHash(info.hash)
+    result.add(wired)
+
+proc adoptPlainHashes(transfer: FileTransfer, localFiles: seq[FileInfo], stored: var seq[FileInfo]): seq[tuple[path: string, hash: string]] =
+  ## Backups made before content hashes were keyed hold the plain hash. Where
+  ## one matches a file we have, the buddy is told the keyed hash instead,
+  ## which spares sending the file again.
+  if not transfer.isEncryptedOnWire():
+    return
+  var plainHashes = initHashSet[string]()
+  for info in localFiles:
+    plainHashes.incl(hashToString(info.hash))
+  for held in stored.mitems:
+    if hashToString(held.hash) in plainHashes:
+      held.hash = transfer.wireHash(held.hash)
+      result.add((held.encryptedPath, hashToString(held.hash)))
 
 proc computeOwnerPlan(transfer: FileTransfer, localFiles: seq[FileInfo], stored: seq[FileInfo]): OwnerPlan =
   ## Works out what the storage buddy should change to match us, and what it
@@ -193,14 +245,45 @@ proc ownerServePhase(folder: OwnedFolder, conn: Connection): Future[bool] {.asyn
     else:
       return sessionFailed("unexpected " & $msg.kind & " while the buddy fetched " & folderName)
 
-proc ownerSyncFolder(folder: OwnedFolder, conn: Connection): Future[bool] {.async.} =
+proc ownerSyncFolder(folder: OwnedFolder, buddyId: string, conn: Connection, report: SessionReport): Future[bool] {.async.} =
   let transfer = folder.transfer
   let folderName = transfer.scanner.folder.name
-  let storedOpt = await transfer.requestListPaths(conn)
-  if storedOpt.isNone():
+  let folderId = folderWireId(transfer.scanner.folder)
+  try:
+    await transfer.protocol.sendMessage(conn, newListPathsRequest(folderId))
+  except CatchableError as e:
+    return sessionFailed("could not ask what the buddy stores of " & folderName & ": " & e.msg)
+  let answer = await transfer.protocol.receiveMessage(conn)
+  if answer.isNone():
     return sessionFailed("the buddy did not say what it stores of " & folderName)
+  if answer.get().kind == msgFolderRefused:
+    # Nothing is changed on either side; the folder simply waits.
+    logSession("the buddy refused " & folderName & ": " & answer.get().refusedReason)
+    report.note(folderName, foRefused, answer.get().refusedReason)
+    return true
+  if answer.get().kind != msgListPathsResponse or answer.get().listResponseFolderId != folderId:
+    return sessionFailed("unexpected answer about what the buddy stores of " & folderName)
+  var listed: seq[FileInfo] = @[]
+  for entry in answer.get().listFiles:
+    listed.add(toFileInfo(entry))
+  var stored = readableStored(transfer, listed)
 
-  let plan = computeOwnerPlan(transfer, folder.files, readableStored(transfer, storedOpt.get()))
+  let rehashes =
+    try:
+      adoptPlainHashes(transfer, folder.files, stored)
+    except CatchableError as e:
+      return sessionFailed("could not compare " & folderName & " with the buddy's copy: " & e.msg)
+  let plan =
+    try:
+      computeOwnerPlan(transfer, wireView(transfer, folder.files), stored)
+    except CatchableError as e:
+      return sessionFailed("could not compare " & folderName & " with the buddy's copy: " & e.msg)
+
+  for rehash in rehashes:
+    try:
+      await transfer.protocol.sendMessage(conn, newRehash(rehash.path, rehash.hash))
+    except CatchableError:
+      return false
 
   for move in plan.moves:
     try:
@@ -229,11 +312,13 @@ proc ownerSyncFolder(folder: OwnedFolder, conn: Connection): Future[bool] {.asyn
   if not await ownerServePhase(folder, conn):
     return false
 
-  # Deletions have reached the buddy by now, so stale index rows can go. An
-  # append-only folder keeps them: they are what stops a file we deleted here
-  # from being restored from the archive again.
+  # This buddy has now been told about every deletion. A tombstone goes once
+  # all the folder's buddies have been. An append-only folder keeps them: they
+  # are what stops a file we deleted here from being restored from the
+  # archive again.
   if not transfer.scanner.folder.appendOnly:
-    transfer.pruneIndexOfMissingFiles()
+    transfer.pruneConfirmedDeletes(buddyId, folder.backupBuddies)
+  report.note(folderName, foSynced)
   true
 
 proc storageOwnerPhase(storage: StorageFolder, conn: Connection): Future[bool] {.async.} =
@@ -262,6 +347,10 @@ proc storageOwnerPhase(storage: StorageFolder, conn: Connection): Future[bool] {
       if not storage.applyMove(msg.oldPath, msg.newPath):
         logSession("could not rename a stored file of the buddy's " & folderName &
           "; it will be fetched again under its new name")
+    of msgRehash:
+      if not storage.applyRehash(msg.rehashPath, msg.rehashHash):
+        logSession("could not update a stored hash of the buddy's " & folderName &
+          "; the file will be fetched again")
     of msgFileDelete:
       if not storage.applyDelete(msg.deletedPath):
         logSession("could not delete a stored file of the buddy's " & folderName)
@@ -289,9 +378,9 @@ proc storageFetchPhase(storage: StorageFolder, conn: Connection, ownerFiles: seq
   except CatchableError as e:
     sessionFailed("connection lost after storing the buddy's " & storage.folderName & ": " & e.msg)
 
-proc runOwnerRound(owned: seq[OwnedFolder], conn: Connection): Future[bool] {.async.} =
+proc runOwnerRound(owned: seq[OwnedFolder], buddyId: string, conn: Connection, report: SessionReport): Future[bool] {.async.} =
   for folder in owned:
-    if not await ownerSyncFolder(folder, conn):
+    if not await ownerSyncFolder(folder, buddyId, conn, report):
       return false
   true
 
@@ -303,6 +392,21 @@ proc runStorageRound(
     protocol: SyncProtocol,
 ): Future[bool] {.async.} =
   for listing in listings:
+    let ownership = decideOwnership(config, buddyId, listing)
+    if ownership.note.len > 0:
+      logSession(ownership.note)
+    if not ownership.accepted:
+      # Answer the owner's first question with a refusal and move on together.
+      let request = await protocol.receiveMessage(conn)
+      if request.isNone() or request.get().kind != msgListPathsRequest or
+          request.get().listFolderId != listing.folderId:
+        return sessionFailed("unexpected message while refusing the buddy's " & listing.folderName)
+      try:
+        await protocol.sendMessage(conn, newFolderRefused(listing.folderId, ownership.note))
+      except CatchableError as e:
+        return sessionFailed("could not refuse the buddy's " & listing.folderName & ": " & e.msg)
+      continue
+
     let storage =
       try:
         newStorageFolder(config, buddyId, listing, protocol)
@@ -378,21 +482,54 @@ proc syncBuddyFolders*(
     buddyId: string,
     conn: Connection,
     protocol: SyncProtocol,
+    ownerMachine = "",
+    takeover = false,
+    report: SessionReport = nil,
 ): Future[bool] {.async.} =
+  ## ownerMachine defaults to this installation's machine id. takeover claims
+  ## our folders at this buddy even if another machine owns them there.
+  ## report, when given, collects the outcome of each of our folders.
+  let machine =
+    if ownerMachine.len > 0: ownerMachine
+    else:
+      try:
+        {.cast(gcsafe).}:
+          machineId()
+      except Exception as e:
+        logSession("cannot read this machine's id (" & e.msg & "); buddies cannot tell it " &
+          "from another machine with the same identity")
+        ""
   var owned: seq[OwnedFolder] = @[]
   defer:
     for folder in owned:
       folder.transfer.close()
+  var sentIds = initTable[string, string]()
   for folder in applicableFolders(config, buddyId):
-    let transfer = newFileTransfer(folder, protocol, config.bandwidthLimitKBps)
+    let wireId = folderWireId(folder)
+    if wireId in sentIds:
+      # The buddy rejects a second list with the same id, which would end
+      # the session for every folder.
+      let reason = "it has the same id as folder " & sentIds[wireId] & " in config.toml"
+      logSession("skipping " & folder.name & ": " & reason)
+      report.note(folder.name, foSkipped, reason)
+      continue
+    sentIds[wireId] = folder.name
+    var transfer: FileTransfer
     try:
-      owned.add(OwnedFolder(transfer: transfer, files: transfer.scanner.scanDirectoryStrict()))
+      transfer = newFileTransfer(folder, protocol, config.bandwidthLimitKBps)
+      owned.add(OwnedFolder(
+        transfer: transfer,
+        files: transfer.scanner.scanDirectoryStrict(),
+        backupBuddies: backupBuddies(config, folder),
+      ))
     except CatchableError as e:
       # Left out of this session entirely, so the buddy keeps its copy as is.
-      transfer.close()
+      if transfer != nil:
+        transfer.close()
       logSession("skipping " & folder.name & " this time: " & e.msg)
+      report.note(folder.name, foSkipped, e.msg)
 
-  let sendListsFut = sendOwnerLists(owned, conn, protocol)
+  let sendListsFut = sendOwnerLists(owned, conn, protocol, machine, takeover)
   let listings = await receiveOwnerLists(conn, protocol)
   if not await sendListsFut:
     return false
@@ -400,7 +537,7 @@ proc syncBuddyFolders*(
   let ownFoldersFirst = config.buddy.uuid < buddyId
   var allOk =
     if ownFoldersFirst:
-      await runOwnerRound(owned, conn)
+      await runOwnerRound(owned, buddyId, conn, report)
     else:
       await runStorageRound(config, buddyId, listings, conn, protocol)
   if allOk:
@@ -408,7 +545,7 @@ proc syncBuddyFolders*(
       if ownFoldersFirst:
         await runStorageRound(config, buddyId, listings, conn, protocol)
       else:
-        await runOwnerRound(owned, conn)
+        await runOwnerRound(owned, buddyId, conn, report)
 
   await awaitSessionEnd(conn, protocol, ownFoldersFirst)
   allOk

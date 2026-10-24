@@ -1,6 +1,11 @@
 "use strict";
 
 const REFRESH_INTERVAL = 5000;
+const FAST_REFRESH_INTERVAL = 1000;
+const FAST_REFRESH_PERIOD = 60 * 1000;
+const REQUEST_SHOWN_FOR = 10 * 60 * 1000;
+const PENDING_TIMEOUT = 20 * 1000;
+const NOTICE_SHOWN_FOR = 15 * 1000;
 
 // Detect base path: if loaded from /w/<secret>/, API calls use the same prefix
 const BASE_PATH = (() => {
@@ -13,12 +18,18 @@ const dom = {
   statusBadge: document.getElementById("status-badge"),
   buddyName: document.getElementById("buddy-name"),
   uptime: document.getElementById("uptime"),
+  build: document.getElementById("build"),
   foldersList: document.getElementById("folders-list"),
   foldersEmpty: document.getElementById("folders-empty"),
   buddiesList: document.getElementById("buddies-list"),
   buddiesEmpty: document.getElementById("buddies-empty"),
   logsContent: document.getElementById("logs-content"),
   logsContainer: document.getElementById("logs-container"),
+  activitySummary: document.getElementById("activity-summary"),
+  activityHistory: document.getElementById("activity-history"),
+  activityHistoryTitle: document.getElementById("activity-history-title"),
+  activityList: document.getElementById("activity-list"),
+  syncRequests: document.getElementById("sync-requests"),
 };
 
 // API helpers
@@ -52,13 +63,68 @@ const api = {
   },
 };
 
-// Formatting
-const formatBytes = (bytes) => {
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${Math.floor(bytes / 1024)} KB`;
-  if (bytes < 1024 * 1024 * 1024) return `${Math.floor(bytes / (1024 * 1024))} MB`;
-  return `${Math.floor(bytes / (1024 * 1024 * 1024))} GB`;
+// Formatting. Dates arrive as UTC ISO 8601 and are shown in the browser's
+// time zone, in the locale from the [gui] locale setting, else the browser's.
+const makeFormatters = (locale) => {
+  const tag = locale || undefined;
+  return {
+    locale: new Intl.DateTimeFormat(tag).resolvedOptions().locale,
+    dateTime: new Intl.DateTimeFormat(tag, { dateStyle: "short", timeStyle: "medium" }),
+    decimal: new Intl.NumberFormat(tag, { maximumFractionDigits: 1 }),
+    integer: new Intl.NumberFormat(tag, { maximumFractionDigits: 0 }),
+    relative: new Intl.RelativeTimeFormat(tag, { numeric: "auto" }),
+  };
 };
+
+const isKnownLocale = (locale) => {
+  if (!locale) return true;
+  try {
+    return Intl.DateTimeFormat.supportedLocalesOf([locale]).length > 0;
+  } catch (e) {
+    return false;
+  }
+};
+
+let fmt = makeFormatters("");
+
+const setLocale = (locale) => {
+  fmt = makeFormatters(isKnownLocale(locale) ? locale : "");
+};
+
+const BYTE_UNITS = ["B", "KB", "MB", "GB", "TB"];
+
+const formatBytes = (bytes, f = fmt) => {
+  let value = bytes;
+  let unit = 0;
+  while (value >= 1024 && unit < BYTE_UNITS.length - 1) {
+    value /= 1024;
+    unit++;
+  }
+  return `${(unit === 0 ? f.integer : f.decimal).format(value)} ${BYTE_UNITS[unit]}`;
+};
+
+const formatCount = (n) => fmt.integer.format(n || 0);
+
+const formatTime = (iso, f = fmt) => (iso ? f.dateTime.format(new Date(iso)) : "");
+
+const RELATIVE_STEPS = [
+  ["second", 60],
+  ["minute", 60],
+  ["hour", 24],
+  ["day", 7],
+  ["week", Infinity],
+];
+
+const formatRelative = (iso, f = fmt) => {
+  let value = (new Date(iso).getTime() - Date.now()) / 1000;
+  for (const [unit, size] of RELATIVE_STEPS) {
+    if (Math.abs(value) < size) return f.relative.format(Math.round(value), unit);
+    value /= size;
+  }
+  return "";
+};
+
+const formatTimeAndAge = (iso) => (iso ? `${formatTime(iso)} (${formatRelative(iso)})` : "");
 
 const formatUptime = (seconds) => {
   const h = Math.floor(seconds / 3600);
@@ -83,6 +149,28 @@ const sharingText = (folder) => {
   return `Backed up to ${target} · ${traits.join(", ")}`;
 };
 
+const FOLDER_STATUS_TEXT = {
+  idle: "Not synced yet",
+  syncing: "Syncing",
+  synced: "Synced",
+  skipped: "Skipped",
+  refused: "Refused",
+  failed: "Sync did not finish",
+};
+
+const folderStatusLine = (status) => {
+  const syncStatus = status.status || "idle";
+  const parts = [FOLDER_STATUS_TEXT[syncStatus] || syncStatus];
+  if (status.lastSync) {
+    parts.push(`last synced ${formatTimeAndAge(status.lastSync)}`);
+  }
+  const totalBytes = status.totalBytes || 0;
+  if (totalBytes > 0) {
+    parts.push(`${formatBytes(status.syncedBytes || 0)} / ${formatBytes(totalBytes)} (${formatCount(status.fileCount)} files)`);
+  }
+  return parts.join(" · ");
+};
+
 const renderFolders = (folders) => {
   latestFolders = folders;
   dom.foldersList.innerHTML = "";
@@ -92,8 +180,8 @@ const renderFolders = (folders) => {
     const status = folder.status || {};
     const totalBytes = status.totalBytes || 0;
     const syncedBytes = status.syncedBytes || 0;
-    const fileCount = status.fileCount || 0;
     const syncStatus = status.status || "idle";
+    const problem = ["skipped", "refused", "failed"].includes(syncStatus);
     const fraction = totalBytes > 0 ? (syncedBytes / totalBytes) * 100 : 0;
 
     const item = document.createElement("div");
@@ -103,14 +191,11 @@ const renderFolders = (folders) => {
         <div class="list-item-name">${escHtml(folder.name)}</div>
         <div class="list-item-detail">${escHtml(folder.path)}</div>
         <div class="list-item-detail">${escHtml(sharingText(folder))}</div>
-        <div class="list-item-detail">
-          ${escHtml(syncStatus)} &mdash;
-          ${formatBytes(syncedBytes)} / ${formatBytes(totalBytes)}
-          (${fileCount} files)
-        </div>
+        <div class="list-item-detail folder-status folder-status-${escAttr(syncStatus)}">${escHtml(folderStatusLine(status))}</div>
+        ${problem && status.detail ? `<div class="list-item-detail folder-problem">${escHtml(status.detail)}</div>` : ""}
       </div>
       <div class="list-item-right">
-        ${syncStatus === "syncing" ? `
+        ${syncStatus === "syncing" && totalBytes > 0 ? `
           <div class="progress-bar">
             <div class="progress-bar-fill" style="width:${fraction}%"></div>
           </div>
@@ -122,6 +207,31 @@ const renderFolders = (folders) => {
     `;
     dom.foldersList.appendChild(item);
   }
+};
+
+let daemonRunning = false;
+
+const formatMinutes = (minutes) => {
+  const h = Math.floor(minutes / 60);
+  const m = minutes % 60;
+  if (h && m) return `${h}h ${m}m`;
+  return h ? `${h}h` : `${m}m`;
+};
+
+const scheduleText = (buddy) => {
+  const when = buddy.syncWindow ? `between ${buddy.syncWindow}` : "any time";
+  if (!daemonRunning || !buddy.intervalMinutes) {
+    return `Syncs ${when}, ${buddy.syncIntervalText || ""}`;
+  }
+  let next = "";
+  if (buddy.nextSync) {
+    const at = new Date(Math.max(Date.parse(buddy.nextSync), Date.now())).toISOString();
+    next = ` · next ${buddy.buddyDials ? "check" : "sync"} ${formatTimeAndAge(at)}`;
+  }
+  if (buddy.buddyDials) {
+    return `${buddy.name || "This buddy"} dials this machine; we meet it at the relay ${when}, every ${formatMinutes(buddy.intervalMinutes)}${next}`;
+  }
+  return `Syncs ${when}, every ${formatMinutes(buddy.intervalMinutes)}${next}`;
 };
 
 const renderBuddies = (buddies, storage = []) => {
@@ -137,7 +247,7 @@ const renderBuddies = (buddies, storage = []) => {
     const latency = buddy.latencyMs >= 0 ? `${buddy.latencyMs}ms` : "";
     const stored = storageById[buddy.id];
     const storedText = stored
-      ? `Storing ${stored.files} files (${formatBytes(stored.bytes)}) in ${stored.path}`
+      ? `Storing ${formatCount(stored.files)} files (${formatBytes(stored.bytes)}) in ${stored.path}`
       : "";
 
     const item = document.createElement("div");
@@ -146,15 +256,241 @@ const renderBuddies = (buddies, storage = []) => {
       <div class="list-item-info">
         <div class="list-item-name">${escHtml(buddy.name || "Unknown")}</div>
         <div class="list-item-detail">${escHtml(shortId)}</div>
+        <div class="list-item-detail">${escHtml(scheduleText(buddy))}</div>
         ${storedText ? `<div class="list-item-detail">${escHtml(storedText)}</div>` : ""}
       </div>
       <div class="list-item-right">
         ${latency ? `<span class="dim">${latency}</span>` : ""}
         <span class="state-${state === "connected" ? "connected" : "disconnected"}">${escHtml(state)}</span>
+        <button class="btn btn-small btn-edit-buddy" data-buddy="${escAttr(buddy.id)}">Edit</button>
         <button class="btn btn-small btn-danger btn-remove-buddy" data-buddy="${escAttr(buddy.id)}">Remove</button>
       </div>
     `;
     dom.buddiesList.appendChild(item);
+  }
+};
+
+
+const formatDuration = (startIso, endIso) => {
+  const seconds = Math.max(0, Math.round((new Date(endIso) - new Date(startIso)) / 1000));
+  if (seconds < 60) return `${seconds} s`;
+  if (seconds < 3600) return `${Math.floor(seconds / 60)} min ${seconds % 60} s`;
+  return `${Math.floor(seconds / 3600)} h ${Math.floor((seconds % 3600) / 60)} min`;
+};
+
+const fileCountText = (n) => `${formatCount(n)} file${n === 1 ? "" : "s"}`;
+
+const sessionBuddy = (s) => s.buddyName || (s.buddyId || "").substring(0, 8) || "a buddy";
+
+const dialText = (s) => {
+  const name = sessionBuddy(s);
+  if (s.via === "relay") return `connected with ${name} through the relay`;
+  return s.dialedBy === "buddy" ? `${name} dialed us` : `we dialed ${name}`;
+};
+
+const transferText = (s, soFar = false) => {
+  const name = sessionBuddy(s);
+  const parts = [];
+  if (s.filesSent || s.bytesSent) {
+    parts.push(`sent ${fileCountText(s.filesSent)} (${formatBytes(s.bytesSent)}) to ${name}`);
+  }
+  if (s.filesReceived || s.bytesReceived) {
+    parts.push(`received ${fileCountText(s.filesReceived)} (${formatBytes(s.bytesReceived)}) from ${name}`);
+  }
+  if (parts.length === 0) return soFar ? "no file data yet" : "no file data needed transferring";
+  const text = parts.join(", ");
+  return (soFar ? "so far " : "") + text.charAt(0).toUpperCase() + text.slice(1);
+};
+
+const outcomeText = (s) => {
+  const name = sessionBuddy(s);
+  switch (s.outcome) {
+    case "ok": return "Finished";
+    case "failed": return "Did not finish, see the log";
+    case "interrupted": return "Cut off when the daemon stopped";
+    case "running": return "Running";
+    case "turned away":
+      return s.dialedBy === "buddy"
+        ? `turned away, a sync with ${name} was already running`
+        : `dropped, a sync with ${name} was already running`;
+    default: return s.outcome;
+  }
+};
+
+const activityLine = (cls, html) => `<div class="activity-line ${cls}">${html}</div>`;
+
+const outcomeSpan = (s) =>
+  `<span class="activity-outcome-${escAttr(s.outcome.replace(" ", "-"))}">${escHtml(outcomeText(s))}</span>`;
+
+const durationText = (s) =>
+  s.outcome === "running" || s.outcome === "interrupted" || s.outcome === "turned away"
+    ? ""
+    : ` · took ${formatDuration(s.startedAt, s.endedAt)}`;
+
+const renderActivity = (sessions) => {
+  const running = sessions.filter((s) => s.outcome === "running");
+  const finished = sessions.filter((s) => s.outcome !== "running" && s.outcome !== "turned away");
+  const last = finished[0];
+  const lines = [];
+
+  for (const s of running) {
+    lines.push(activityLine("activity-running",
+      `<strong>Syncing with ${escHtml(sessionBuddy(s))}</strong> since ${escHtml(formatTime(s.startedAt))} · ${escHtml(dialText(s))}`));
+    lines.push(activityLine("activity-detail", escHtml(transferText(s, true))));
+  }
+
+  if (last) {
+    lines.push(activityLine("",
+      `<strong>Last sync</strong> with ${escHtml(sessionBuddy(last))}: ${escHtml(formatTimeAndAge(last.startedAt))}` +
+      `${escHtml(durationText(last))} · ${escHtml(dialText(last))} · ${outcomeSpan(last)}`));
+    lines.push(activityLine("activity-detail", escHtml(transferText(last))));
+  } else if (running.length === 0) {
+    lines.push(activityLine("activity-detail", "No sync sessions yet."));
+  }
+
+  const turnedAway = sessions.find((s) => s.outcome === "turned away");
+  if (turnedAway && (!last || new Date(turnedAway.startedAt) >= new Date(last.startedAt))) {
+    lines.push(activityLine("activity-outcome-turned-away",
+      `${escHtml(formatTime(turnedAway.startedAt))}: ${escHtml(dialText(turnedAway))} · ${escHtml(outcomeText(turnedAway))}`));
+  }
+
+  const totals = {};
+  for (const s of sessions) {
+    const name = sessionBuddy(s);
+    const t = (totals[name] ||= { bytesSent: 0, bytesReceived: 0, filesSent: 0, filesReceived: 0, buddyName: name });
+    t.bytesSent += s.bytesSent || 0;
+    t.bytesReceived += s.bytesReceived || 0;
+    t.filesSent += s.filesSent || 0;
+    t.filesReceived += s.filesReceived || 0;
+  }
+  const totalTexts = Object.values(totals)
+    .filter((t) => t.bytesSent || t.bytesReceived || t.filesSent || t.filesReceived)
+    .map((t) => {
+      const text = transferText(t);
+      return text.charAt(0).toLowerCase() + text.slice(1);
+    });
+  if (sessions.length > 1 && totalTexts.length > 0) {
+    lines.push(activityLine("activity-detail",
+      `Over the last ${sessions.length} sessions: ${escHtml(totalTexts.join("; "))}`));
+  }
+
+  dom.activitySummary.innerHTML = lines.join("");
+
+  dom.activityHistory.hidden = sessions.length === 0;
+  dom.activityHistoryTitle.textContent = `Recent sessions (${sessions.length})`;
+  dom.activityList.innerHTML = sessions.map((s) => {
+    const transfer = s.outcome === "turned away" ? "" :
+      `<div class="list-item-detail">${escHtml(transferText(s, s.outcome === "running"))}</div>`;
+    return `
+      <div class="list-item">
+        <div class="list-item-info">
+          <div class="list-item-name">${escHtml(formatTime(s.startedAt))} · ${escHtml(sessionBuddy(s))}</div>
+          <div class="list-item-detail">${escHtml(dialText(s))}${escHtml(durationText(s))} · ${outcomeSpan(s)}</div>
+          ${transfer}
+        </div>
+      </div>`;
+  }).join("");
+};
+
+// Sync requests from the GUI: what the daemon did with them
+let pendingRequest = null;
+let requestNotice = null;
+let fastRefreshUntil = 0;
+let latestRequests = [];
+
+const REQUEST_TEXT = {
+  "looking up": "looking up the buddy's address...",
+  "dialing": "connecting...",
+  "connected": "connected, syncing",
+  "already syncing": "a sync with this buddy is already running",
+  "not found": "could not find the buddy",
+  "unreachable": "could not connect",
+};
+
+const REQUEST_CLASS = {
+  "looking up": "request-pending",
+  "dialing": "request-pending",
+  "connected": "activity-outcome-ok",
+  "already syncing": "request-busy",
+  "not found": "request-failed",
+  "unreachable": "request-failed",
+};
+
+const showNotice = (text, cls) => {
+  requestNotice = { text, cls, at: Date.now() };
+  renderRequests(latestRequests);
+};
+
+const renderRequests = (requests) => {
+  latestRequests = requests;
+  const now = Date.now();
+  const lines = [];
+
+  if (requestNotice && now - requestNotice.at < NOTICE_SHOWN_FOR) {
+    lines.push(activityLine(requestNotice.cls, escHtml(requestNotice.text)));
+  }
+
+  if (pendingRequest) {
+    const picked = requests.some((r) =>
+      pendingRequest.ids.includes(r.buddyId) &&
+      (new Date(r.updatedAt).getTime() >= pendingRequest.at - 5000 || REQUEST_CLASS[r.state] === "request-pending"));
+    if (picked) {
+      pendingRequest = null;
+    } else if (now - pendingRequest.at > PENDING_TIMEOUT) {
+      lines.push(activityLine("request-failed",
+        `Sync requested with ${escHtml(pendingRequest.names.join(", "))}, but the daemon has not picked it up. Is it running?`));
+    } else {
+      lines.push(activityLine("request-pending",
+        `Sync requested with ${escHtml(pendingRequest.names.join(", "))}, waiting for the daemon...`));
+    }
+  }
+
+  for (const r of requests) {
+    const age = now - new Date(r.updatedAt).getTime();
+    if (age > REQUEST_SHOWN_FOR || (r.state === "connected" && age > 60 * 1000)) continue;
+    lines.push(activityLine(REQUEST_CLASS[r.state] || "",
+      `Sync requested with <strong>${escHtml(r.buddyName || buddyLabel(r.buddyId))}</strong> at ${escHtml(formatTime(r.requestedAt))} · ${escHtml(REQUEST_TEXT[r.state] || r.state)}`));
+    if (r.detail) lines.push(activityLine("activity-detail", escHtml(r.detail)));
+  }
+
+  dom.syncRequests.innerHTML = lines.join("");
+  dom.syncRequests.hidden = lines.length === 0;
+};
+
+const requestSync = async (endpoint, button) => {
+  const label = button.textContent;
+  button.disabled = true;
+  button.textContent = "Requesting...";
+  try {
+    const result = await api.postResult(endpoint);
+    const data = result.data || {};
+    const buddies = data.buddies || [];
+    if (!result.ok) {
+      showNotice(data.error || "Could not request a sync.", "request-failed");
+    } else if (!data.daemonRunning) {
+      showNotice("The daemon is not running, so nothing will sync until it is started.", "request-failed");
+    } else if (data.folders === 0) {
+      showNotice("There are no folders to sync. Add a folder first.", "request-busy");
+    } else if (buddies.length === 0) {
+      showNotice("No buddy to sync with. Pair with a buddy first.", "request-busy");
+    } else {
+      requestNotice = null;
+      pendingRequest = {
+        at: Date.now(),
+        ids: buddies.map((b) => b.id),
+        names: buddies.map((b) => b.name || b.id.substring(0, 8)),
+      };
+      fastRefreshUntil = Date.now() + FAST_REFRESH_PERIOD;
+      renderRequests(latestRequests);
+    }
+    await refresh();
+  } catch (e) {
+    showNotice(`Could not reach BuddyDrive: ${e.message}`, "request-failed");
+  } finally {
+    setTimeout(() => {
+      button.disabled = false;
+      button.textContent = label;
+    }, 1500);
   }
 };
 
@@ -182,6 +518,11 @@ const renderStatus = (data) => {
 
   const uptime = data.uptime || 0;
   dom.uptime.textContent = running ? formatUptime(uptime) : "";
+  daemonRunning = running;
+
+  const build = data.build;
+  dom.build.textContent = build ? `v${build.version} · ${build.commit}` : "";
+  dom.build.title = build ? `Built ${formatTime(build.builtAt)} · wire protocol ${build.protocolVersion}` : "";
 };
 
 const renderLogs = (logs) => {
@@ -202,15 +543,18 @@ const escAttr = (str) => escHtml(str).replace(/"/g, "&quot;");
 // Refresh all data
 const refresh = async () => {
   try {
-    const [status, folders, buddies, storage] = await Promise.all([
+    const [status, folders, buddies, storage, sessions] = await Promise.all([
       api.get("/status"),
       api.get("/folders"),
       api.get("/buddies"),
       api.get("/storage").catch(() => ({ storage: [] })),
+      api.get("/sessions").catch(() => ({ sessions: [] })),
     ]);
     renderStatus(status);
+    renderActivity(sessions.sessions || []);
     renderFolders(folders.folders || []);
     renderBuddies(buddies.buddies || [], storage.storage || []);
+    renderRequests(sessions.requests || []);
   } catch (e) {
     console.error("Refresh failed:", e);
   }
@@ -252,33 +596,38 @@ const initEvents = () => {
       document.getElementById("settings-announce").value = net.announce_addr || "";
       document.getElementById("settings-relay-url").value = net.api_base_url || "";
       document.getElementById("settings-relay-region").value = net.relay_region || "";
-      document.getElementById("settings-sync-start").value = net.sync_window_start || "";
-      document.getElementById("settings-sync-end").value = net.sync_window_end || "";
+      document.getElementById("settings-locale").value = data.gui?.locale || "";
     } catch (e) {
       // leave empty
     }
+    updateLocalePreview();
     openDialog("dialog-settings");
   });
 
-  // Sync All
-  document.getElementById("btn-sync-all").addEventListener("click", async () => {
-    try {
-      const data = await api.get("/folders");
-      const folders = data.folders || [];
-      await Promise.all(folders.map((f) => api.post(`/sync/${f.name}`)));
-      await refresh();
-    } catch (e) {
-      console.error("Sync all failed:", e);
+  const updateLocalePreview = () => {
+    const value = document.getElementById("settings-locale").value.trim();
+    const preview = document.getElementById("settings-locale-preview");
+    if (!isKnownLocale(value)) {
+      preview.textContent = `This browser does not know the locale "${value}".`;
+      return;
     }
+    const f = makeFormatters(value);
+    const example = new Date(Date.now() - 5 * 60 * 1000).toISOString();
+    preview.textContent = `${f.locale}: ${formatTime(example, f)} (${formatRelative(example, f)}) · ${formatBytes(1288490189, f)}`;
+  };
+
+  document.getElementById("settings-locale").addEventListener("input", updateLocalePreview);
+
+  // Sync All
+  document.getElementById("btn-sync-all").addEventListener("click", (e) => {
+    requestSync("/sync", e.currentTarget);
   });
 
   // Per-folder sync and remove (delegated)
   dom.foldersList.addEventListener("click", async (e) => {
     const syncBtn = e.target.closest(".btn-sync");
     if (syncBtn) {
-      const name = syncBtn.dataset.folder;
-      await api.post(`/sync/${encodeURIComponent(name)}`);
-      await refresh();
+      await requestSync(`/sync/${encodeURIComponent(syncBtn.dataset.folder)}`, syncBtn);
       return;
     }
 
@@ -299,8 +648,15 @@ const initEvents = () => {
     }
   });
 
-  // Per-buddy remove (delegated)
+  // Per-buddy edit and remove (delegated)
   dom.buddiesList.addEventListener("click", async (e) => {
+    const editBtn = e.target.closest(".btn-edit-buddy");
+    if (editBtn) {
+      const buddy = latestBuddies.find((b) => b.id === editBtn.dataset.buddy);
+      if (buddy) openEditBuddyDialog(buddy);
+      return;
+    }
+
     const removeBtn = e.target.closest(".btn-remove-buddy");
     if (removeBtn) {
       const id = removeBtn.dataset.buddy;
@@ -380,6 +736,7 @@ const initEvents = () => {
     document.getElementById("buddy-id").value = "";
     document.getElementById("buddy-pair-name").value = "";
     document.getElementById("buddy-code").value = "";
+    document.getElementById("pair-error").hidden = true;
     document.getElementById("pair-hint").textContent =
       "Enter the code your buddy sent you, or generate one and send it to them. Both of you must use the same code.";
     openDialog("dialog-pair-buddy");
@@ -402,10 +759,64 @@ const initEvents = () => {
     const buddyId = document.getElementById("buddy-id").value.trim();
     const buddyName = document.getElementById("buddy-pair-name").value.trim();
     const code = document.getElementById("buddy-code").value.trim();
-    if (!buddyId || !code) return;
+    const error = document.getElementById("pair-error");
+    const missing = [];
+    if (!buddyId) missing.push("the buddy's ID");
+    if (!buddyName) missing.push("a name for the buddy");
+    if (!code) missing.push("a pairing code");
+    if (missing.length > 0) {
+      error.textContent = `Enter ${missing.join(", ")}.`;
+      error.hidden = false;
+      return;
+    }
 
-    await api.post("/buddies/pair", { buddyId, buddyName, code });
+    const result = await api.postResult("/buddies/pair", { buddyId, buddyName, code });
+    if (!result.ok) {
+      error.textContent = result.data.error || "Could not pair with the buddy.";
+      error.hidden = false;
+      return;
+    }
     closeDialog("dialog-pair-buddy");
+    await refresh();
+  });
+
+  // Edit Buddy dialog
+  const openEditBuddyDialog = (buddy) => {
+    document.getElementById("edit-buddy-id").value = buddy.id;
+    document.getElementById("edit-buddy-uuid").textContent = `Buddy ID ${buddy.id}`;
+    document.getElementById("edit-buddy-name").value = buddy.name || "";
+    document.getElementById("edit-buddy-window").value = buddy.syncWindow || "";
+    document.getElementById("edit-buddy-interval").value = buddy.syncInterval || "";
+    document.getElementById("edit-buddy-error").hidden = true;
+    openDialog("dialog-edit-buddy");
+  };
+
+  document.getElementById("btn-cancel-edit-buddy").addEventListener("click", () => {
+    closeDialog("dialog-edit-buddy");
+  });
+
+  document.getElementById("btn-submit-edit-buddy").addEventListener("click", async (e) => {
+    e.preventDefault();
+    const id = document.getElementById("edit-buddy-id").value;
+    const name = document.getElementById("edit-buddy-name").value.trim();
+    const error = document.getElementById("edit-buddy-error");
+    if (!name) {
+      error.textContent = "Enter a name for the buddy.";
+      error.hidden = false;
+      return;
+    }
+    const result = await api.postResult("/buddies/update", {
+      id,
+      name,
+      sync_window: document.getElementById("edit-buddy-window").value.trim(),
+      sync_interval: document.getElementById("edit-buddy-interval").value.trim(),
+    });
+    if (!result.ok) {
+      error.textContent = result.data.error || "Could not save the buddy.";
+      error.hidden = false;
+      return;
+    }
+    closeDialog("dialog-edit-buddy");
     await refresh();
   });
 
@@ -416,7 +827,12 @@ const initEvents = () => {
 
   document.getElementById("btn-submit-settings").addEventListener("click", async (e) => {
     e.preventDefault();
-    const body = { buddy: {}, network: {} };
+    const locale = document.getElementById("settings-locale").value.trim();
+    if (!isKnownLocale(locale)) {
+      updateLocalePreview();
+      return;
+    }
+    const body = { buddy: {}, network: {}, gui: { locale } };
 
     const name = document.getElementById("settings-name").value.trim();
     if (name) body.buddy.name = name;
@@ -433,10 +849,8 @@ const initEvents = () => {
     const relayRegion = document.getElementById("settings-relay-region").value.trim();
     if (relayRegion) body.network.relay_region = relayRegion;
 
-    body.network.sync_window_start = document.getElementById("settings-sync-start").value.trim();
-    body.network.sync_window_end = document.getElementById("settings-sync-end").value.trim();
-
     const result = await api.post("/config", body);
+    setLocale(locale);
     closeDialog("dialog-settings");
     await refresh();
     if (result.restartRequired) {
@@ -449,7 +863,19 @@ const initEvents = () => {
 };
 
 // Init
+const loadLocale = async () => {
+  try {
+    const data = await api.get("/config");
+    setLocale(data.gui?.locale || "");
+  } catch (e) {
+    setLocale("");
+  }
+};
+
 initEvents();
-refresh();
+loadLocale().then(refresh);
 refreshLogs();
 setInterval(refresh, REFRESH_INTERVAL);
+setInterval(() => {
+  if (Date.now() < fastRefreshUntil) refresh();
+}, FAST_REFRESH_INTERVAL);

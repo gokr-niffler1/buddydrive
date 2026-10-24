@@ -129,7 +129,7 @@ proc publishBuddy*(discovery: DiscoveryService, buddy: BuddyInfo, relayRegion: s
     discovery.node.peerIdStr(),
     discovery.node.getAdvertisedAddrs(),
     isPubliclyReachable,
-    buddy.syncTime,
+    buddy.syncWindow,
     relayRegion,
   )
   let hmacHex = try: computeHmac(authKey, recordJson) except: return false

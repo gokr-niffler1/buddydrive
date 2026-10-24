@@ -15,12 +15,25 @@
     <div class="header-right">
       <span id="buddy-name"></span>
       <span id="uptime" class="dim"></span>
+      <span id="build" class="dim"></span>
       <button id="btn-refresh" class="btn btn-small" title="Refresh">Refresh</button>
       <button id="btn-settings" class="btn btn-small" title="Settings">Settings</button>
     </div>
   </header>
 
   <main>
+    <section class="card">
+      <div class="card-header">
+        <h2>Sync activity</h2>
+      </div>
+      <div id="activity-summary" class="activity-summary"></div>
+      <div id="sync-requests" class="activity-summary sync-requests" hidden></div>
+      <details id="activity-history" class="activity-history" hidden>
+        <summary id="activity-history-title">Recent sessions</summary>
+        <div id="activity-list" class="list"></div>
+      </details>
+    </section>
+
     <section class="card">
       <div class="card-header">
         <h2>Folders</h2>
@@ -91,17 +104,45 @@
       <h3>Pair with Buddy</h3>
       <label for="buddy-id">Buddy ID</label>
       <input type="text" id="buddy-id" placeholder="UUID" required>
-      <label for="buddy-pair-name">Buddy name (optional)</label>
-      <input type="text" id="buddy-pair-name" placeholder="Friend's name">
+      <label for="buddy-pair-name">Buddy name</label>
+      <input type="text" id="buddy-pair-name" placeholder="Who is this? e.g. Alice" required>
       <label for="buddy-code">Pairing code</label>
       <div class="input-row">
         <input type="text" id="buddy-code" placeholder="XXXX-XXXX" required>
         <button type="button" class="btn btn-small" id="btn-generate-code">Generate</button>
       </div>
       <p class="dim" id="pair-hint">Enter the code your buddy sent you, or generate one and send it to them. Both of you must use the same code.</p>
+      <p class="dialog-note">When to sync can be changed afterwards with Edit on the buddy.</p>
+      <p class="dialog-error" id="pair-error" hidden></p>
       <div class="dialog-actions">
         <button type="button" class="btn" id="btn-cancel-pair">Cancel</button>
         <button type="submit" class="btn btn-primary" id="btn-submit-pair">Pair</button>
+      </div>
+    </form>
+  </dialog>
+
+  <!-- Edit Buddy Dialog -->
+  <dialog id="dialog-edit-buddy">
+    <form method="dialog">
+      <h3>Edit Buddy</h3>
+      <input type="hidden" id="edit-buddy-id">
+      <p class="dialog-note" id="edit-buddy-uuid"></p>
+      <label for="edit-buddy-name">Buddy name</label>
+      <input type="text" id="edit-buddy-name" placeholder="Alice" required>
+      <fieldset>
+        <legend>When to sync</legend>
+        <label for="edit-buddy-window">Sync window</label>
+        <input type="text" id="edit-buddy-window" placeholder="22:00-06:00">
+        <p class="dialog-note">HH:MM-HH:MM, may cross midnight. Empty means any time.</p>
+        <label for="edit-buddy-interval">Sync interval</label>
+        <input type="text" id="edit-buddy-interval" placeholder="30m">
+        <p class="dialog-note">For example 30m, 2h or 1h30m. Empty means every 5m until the first contact, then every 30m.</p>
+      </fieldset>
+      <p class="dialog-note">The window and interval decide when this machine reaches out. A buddy's own sync is always accepted.</p>
+      <p class="dialog-error" id="edit-buddy-error" hidden></p>
+      <div class="dialog-actions">
+        <button type="button" class="btn" id="btn-cancel-edit-buddy">Cancel</button>
+        <button type="submit" class="btn btn-primary" id="btn-submit-edit-buddy">Save</button>
       </div>
     </form>
   </dialog>
@@ -134,12 +175,23 @@
       </fieldset>
 
       <fieldset>
-        <legend>Sync Window</legend>
-        <label for="settings-sync-start">Start time (HH:MM, empty = always)</label>
-        <input type="text" id="settings-sync-start" placeholder="HH:MM">
-        <label for="settings-sync-end">End time (HH:MM)</label>
-        <input type="text" id="settings-sync-end" placeholder="HH:MM">
+        <legend>Display</legend>
+        <label for="settings-locale">Date and number format</label>
+        <input type="text" id="settings-locale" list="locale-suggestions" placeholder="Browser default">
+        <datalist id="locale-suggestions">
+          <option value="sv-SE">Svenska (Sverige)</option>
+          <option value="en-GB">English (UK)</option>
+          <option value="en-US">English (US)</option>
+          <option value="de-DE">Deutsch (Deutschland)</option>
+          <option value="fi-FI">Suomi (Suomi)</option>
+          <option value="nb-NO">Norsk bokmål (Norge)</option>
+          <option value="da-DK">Dansk (Danmark)</option>
+        </datalist>
+        <p class="dialog-note" id="settings-locale-preview"></p>
+        <p class="dialog-note">A language tag such as sv-SE. Empty uses the browser's language. Stored in config.toml, so every browser showing this daemon uses it.</p>
       </fieldset>
+
+      <p class="dialog-note">When to sync is set per buddy: use Edit on a buddy.</p>
 
       <div class="dialog-actions">
         <button type="button" class="btn" id="btn-cancel-settings">Cancel</button>

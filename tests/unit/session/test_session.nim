@@ -1,30 +1,66 @@
-import std/[json, options, os, sequtils, strutils, unittest]
+import std/[json, options, os, sequtils, strutils, tables, unittest]
+from std/times import fromUnix, toUnix
 import chronos
 import libp2p/stream/bridgestream
 import ../../../src/buddydrive/types
 import ../../../src/buddydrive/p2p/messages
 import ../../../src/buddydrive/p2p/protocol
 import ../../../src/buddydrive/sync/session
+import ../../../src/buddydrive/sync/index
+import ../../../src/buddydrive/sync/transfer
+import ../../../src/buddydrive/crypto
+from ../../../src/buddydrive/config import getIndexPath
+import db_connector/db_sqlite
 import ../../testutils
 import ../../support/sync_fixtures
 
 useIsolatedDataDir("session")
 
-proc runBridgeSync(cfg1: AppConfig, cfg2: AppConfig): Future[tuple[leftOk: bool, rightOk: bool]] {.async.} =
+proc runBridgeSync(cfg1: AppConfig, cfg2: AppConfig, report: SessionReport = nil): Future[tuple[leftOk: bool, rightOk: bool]] {.async.} =
   let (left, right) = bridgedConnections(closeTogether = false)
   defer:
     await left.close()
     await right.close()
 
-  let fut1 = syncBuddyFolders(cfg1, cfg1.buddies[0].id.uuid, left, newSyncProtocol())
+  let fut1 = syncBuddyFolders(cfg1, cfg1.buddies[0].id.uuid, left, newSyncProtocol(), report = report)
   let fut2 = syncBuddyFolders(cfg2, cfg2.buddies[0].id.uuid, right, newSyncProtocol())
   result.leftOk = await fut1
   result.rightOk = await fut2
 
-proc syncBoth(cfg1, cfg2: AppConfig) =
-  let outcome = waitFor runBridgeSync(cfg1, cfg2)
+proc syncBoth(cfg1, cfg2: AppConfig, report: SessionReport = nil) =
+  let outcome = waitFor runBridgeSync(cfg1, cfg2, report)
   check outcome.leftOk
   check outcome.rightOk
+
+proc syncCounting(cfg1, cfg2: AppConfig): tuple[ok: bool, received: int64] =
+  ## Syncs once and returns how much file data the second side received.
+  proc run(): Future[tuple[ok: bool, received: int64]] {.async.} =
+    let (left, right) = bridgedConnections(closeTogether = false)
+    defer:
+      await left.close()
+      await right.close()
+    let storageSide = newSyncProtocol()
+    let fut1 = syncBuddyFolders(cfg1, cfg1.buddies[0].id.uuid, left, newSyncProtocol())
+    let fut2 = syncBuddyFolders(cfg2, cfg2.buddies[0].id.uuid, right, storageSide)
+    let ok1 = await fut1
+    let ok2 = await fut2
+    result = (ok1 and ok2, storageSide.fileBytesReceived)
+  waitFor run()
+
+proc storedHashes(root: string): seq[string] =
+  for path in storedFiles(root, ".meta"):
+    result.add(parseJson(readFile(root / path))["hash"].getStr())
+
+proc plainHash(path: string): string =
+  hashToString(hashFileStream(path))
+
+proc unkeyStoredHashes(root: string, folder: FolderConfig) =
+  ## Rewrites the sidecars the way a buddy kept them before hashes were keyed.
+  for path in storedFiles(root, ".meta"):
+    let node = parseJson(readFile(root / path))
+    let plainPath = decryptPath(node["encryptedPath"].getStr(), folder.folderKey)
+    node["hash"] = %plainHash(folder.path / plainPath)
+    writeFile(root / path, $node)
 
 proc readBlobs(root: string): seq[string] =
   for path in storedFiles(root, ".blob"):
@@ -107,6 +143,80 @@ suite "Session sync":
       when defined(posix):
         check symlinkExists(restored / "plan-link")
         check expandSymlink(restored / "plan-link") == "plan.txt"
+
+  test "the buddy is told a keyed content hash, never the plain one":
+    withTestDir("session_keyed_hash"):
+      let folderA = testDir / "a"
+      createDir(folderA)
+      createDir(testDir / "b")
+      writeFile(folderA / "known.txt", "a file the buddy might also have\n")
+      let folder = syncFolder("folder-a", folderA)
+      syncBoth(peerConfig(BuddyOne, BuddyTwo, testDir / "a-stores", @[folder]),
+        peerConfig(BuddyTwo, BuddyOne, testDir / "b-stores", @[syncFolder("folder-b", testDir / "b")]))
+
+      let hashes = storedHashes(testDir / "b-stores" / "folder-a")
+      let plain = hashFileStream(folderA / "known.txt")
+      check hashes == @[hashToString(keyedContentHash(plain, folder.folderKey))]
+      check hashToString(plain) notin hashes
+
+  test "a backup with plain hashes is rekeyed without sending the files again":
+    withTestDir("session_rekey"):
+      let folderA = testDir / "a"
+      createDir(folderA)
+      createDir(testDir / "b")
+      writeFile(folderA / "one.txt", "one\n")
+      writeFile(folderA / "two.txt", "two\n")
+      let folder = syncFolder("folder-a", folderA)
+      let cfgA = peerConfig(BuddyOne, BuddyTwo, testDir / "a-stores", @[folder])
+      let cfgB = peerConfig(BuddyTwo, BuddyOne, testDir / "b-stores", @[syncFolder("folder-b", testDir / "b")])
+      syncBoth(cfgA, cfgB)
+      let stored = testDir / "b-stores" / "folder-a"
+      let keyed = storedHashes(stored)
+      let blobs = readBlobs(stored)
+
+      unkeyStoredHashes(stored, folder)
+      check storedHashes(stored) != keyed
+      let outcome = syncCounting(cfgA, cfgB)
+      check outcome.ok
+      check outcome.received == 0
+      check storedHashes(stored) == keyed
+      check readBlobs(stored) == blobs
+
+  test "a file backed up with a plain hash can still be restored":
+    withTestDir("session_restore_plain_hash"):
+      let folderA = testDir / "a"
+      createDir(folderA)
+      createDir(testDir / "b")
+      writeFile(folderA / "old.txt", "backed up long ago\n")
+      let source = syncFolder("folder-a", folderA)
+      let cfgB = peerConfig(BuddyTwo, BuddyOne, testDir / "b-stores", @[syncFolder("folder-b", testDir / "b")])
+      syncBoth(peerConfig(BuddyOne, BuddyTwo, testDir / "a-stores", @[source]), cfgB)
+      unkeyStoredHashes(testDir / "b-stores" / "folder-a", source)
+
+      let restored = testDir / "restored"
+      createDir(restored)
+      var replacement = source
+      replacement.path = restored
+      syncBoth(peerConfig(BuddyOne, BuddyTwo, testDir / "a-stores", @[replacement]), cfgB)
+      check readFile(restored / "old.txt") == "backed up long ago\n"
+
+  test "a folder with the same id as another is skipped, not fatal":
+    withTestDir("session_duplicate_id"):
+      createDir(testDir / "first")
+      createDir(testDir / "copy")
+      createDir(testDir / "b")
+      writeFile(testDir / "first" / "kept.txt", "kept\n")
+      writeFile(testDir / "copy" / "other.txt", "other\n")
+      let first = syncFolder("folder-a", testDir / "first", name = "first")
+      var copy = syncFolder("folder-a", testDir / "copy", name = "copy")
+      copy.folderKey = first.folderKey
+      let report = SessionReport()
+      syncBoth(peerConfig(BuddyOne, BuddyTwo, testDir / "a-stores", @[first, copy]),
+        peerConfig(BuddyTwo, BuddyOne, testDir / "b-stores", @[syncFolder("folder-b", testDir / "b")]), report)
+
+      check report.folders.anyIt(it.folderName == "copy" and it.outcome == foSkipped and "first" in it.reason)
+      check report.folders.anyIt(it.folderName == "first" and it.outcome == foSynced)
+      check storedFiles(testDir / "b-stores" / "folder-a", ".blob").len == 1
 
   test "renames move the stored blob instead of sending it again":
     withTestDir("session_move"):
@@ -239,8 +349,12 @@ suite "Session sync":
 
       moveDir(setup.one, testDir / "unplugged")
       writeFile(setup.two / "new.txt", "new\n")
-      syncBoth(setup.cfgA, setup.cfgB)
+      let report = SessionReport()
+      syncBoth(setup.cfgA, setup.cfgB, report)
 
+      check report.folders.len == 2
+      check report.folders.anyIt(it.folderName == "one" and it.outcome == foSkipped and it.reason.len > 0)
+      check report.folders.anyIt(it.folderName == "two" and it.outcome == foSynced)
       check readBlobs(storedOne) == before
       check storedFiles(testDir / "b-stores" / "folder-two", ".blob").len == 2
 
@@ -348,6 +462,218 @@ suite "Session sync":
         if fileExists(restored / name):
           inc back
       check back == 1
+  proc syncPair(owner: AppConfig, buddyId: string, buddy: AppConfig) =
+    proc run(): Future[tuple[leftOk: bool, rightOk: bool]] {.async.} =
+      let (left, right) = bridgedConnections(closeTogether = false)
+      defer:
+        await left.close()
+        await right.close()
+      let fut1 = syncBuddyFolders(owner, buddyId, left, newSyncProtocol())
+      let fut2 = syncBuddyFolders(buddy, buddy.buddies[0].id.uuid, right, newSyncProtocol())
+      result.leftOk = await fut1
+      result.rightOk = await fut2
+    let outcome = waitFor run()
+    check outcome.leftOk
+    check outcome.rightOk
+
+  test "a delete reaches every buddy before its tombstone goes":
+    # One index serves all the buddies of a folder. Clearing a deleted file's
+    # row after the first buddy heard of it made the second buddy look like it
+    # held a file we never had, so the file was restored from there.
+    withTestDir("session_two_buddies"):
+      const BuddyThree = "33333333-3333-3333-3333-333333333333"
+      let folderA = testDir / "a"
+      createDir(folderA)
+      createDir(testDir / "b")
+      createDir(testDir / "c")
+      writeFile(folderA / "doomed.txt", "delete me\n")
+      writeFile(folderA / "kept.txt", "keep me\n")
+
+      var cfgA = peerConfig(BuddyOne, BuddyTwo, testDir / "a-stores-b", @[syncFolder("folder-a", folderA)])
+      var third: BuddyInfo
+      third.id = newBuddyId(BuddyThree, "peer-3333")
+      third.storagePath = testDir / "a-stores-c"
+      cfgA.buddies.add(third)
+      cfgA.folders[0].buddies = @[]
+      let cfgB = peerConfig(BuddyTwo, BuddyOne, testDir / "b-stores", @[syncFolder("folder-b", testDir / "b")])
+      let cfgC = peerConfig(BuddyThree, BuddyOne, testDir / "c-stores", @[syncFolder("folder-c", testDir / "c")])
+
+      syncPair(cfgA, BuddyTwo, cfgB)
+      syncPair(cfgA, BuddyThree, cfgC)
+      check storedFiles(testDir / "b-stores" / "folder-a", ".blob").len == 2
+      check storedFiles(testDir / "c-stores" / "folder-a", ".blob").len == 2
+
+      removeFile(folderA / "doomed.txt")
+      syncPair(cfgA, BuddyTwo, cfgB)
+      check storedFiles(testDir / "b-stores" / "folder-a", ".blob").len == 1
+
+      syncPair(cfgA, BuddyThree, cfgC)
+      check not fileExists(folderA / "doomed.txt")
+      check storedFiles(testDir / "c-stores" / "folder-a", ".blob").len == 1
+
+      # Both have confirmed now; nothing comes back from either.
+      syncPair(cfgA, BuddyTwo, cfgB)
+      syncPair(cfgA, BuddyThree, cfgC)
+      check not fileExists(folderA / "doomed.txt")
+      check fileExists(folderA / "kept.txt")
+
+  test "a file deleted, recreated and deleted again still reaches every buddy":
+    withTestDir("session_delete_twice"):
+      const BuddyThree = "33333333-3333-3333-3333-333333333333"
+      let folderA = testDir / "a"
+      createDir(folderA)
+      createDir(testDir / "b")
+      createDir(testDir / "c")
+      writeFile(folderA / "flip.txt", "v1\n")
+
+      var cfgA = peerConfig(BuddyOne, BuddyTwo, testDir / "a-stores-b", @[syncFolder("folder-a", folderA)])
+      var third: BuddyInfo
+      third.id = newBuddyId(BuddyThree, "peer-3333")
+      cfgA.buddies.add(third)
+      cfgA.folders[0].buddies = @[]
+      let cfgB = peerConfig(BuddyTwo, BuddyOne, testDir / "b-stores", @[syncFolder("folder-b", testDir / "b")])
+      let cfgC = peerConfig(BuddyThree, BuddyOne, testDir / "c-stores", @[syncFolder("folder-c", testDir / "c")])
+
+      syncPair(cfgA, BuddyTwo, cfgB)
+      syncPair(cfgA, BuddyThree, cfgC)
+      removeFile(folderA / "flip.txt")
+      syncPair(cfgA, BuddyTwo, cfgB)            # B confirms the first delete
+      writeFile(folderA / "flip.txt", "v2\n")   # back before C heard of it
+      syncPair(cfgA, BuddyTwo, cfgB)
+      syncPair(cfgA, BuddyThree, cfgC)
+      removeFile(folderA / "flip.txt")
+      syncPair(cfgA, BuddyThree, cfgC)          # only C confirms the second delete
+      syncPair(cfgA, BuddyTwo, cfgB)            # B's old confirmation must not count
+
+      check not fileExists(folderA / "flip.txt")
+      check storedFiles(testDir / "b-stores" / "folder-a", ".blob").len == 0
+      check storedFiles(testDir / "c-stores" / "folder-a", ".blob").len == 0
+
+  test "renaming a folder keeps its deletes":
+    # The index was keyed by the folder's name, so a rename lost every
+    # tombstone and a deleted file came back from a buddy that had not
+    # heard of the delete yet.
+    withTestDir("session_rename_folder"):
+      const BuddyThree = "33333333-3333-3333-3333-333333333333"
+      let folderA = testDir / "a"
+      createDir(folderA)
+      createDir(testDir / "b")
+      createDir(testDir / "c")
+      writeFile(folderA / "doomed.txt", "delete me\n")
+      writeFile(folderA / "kept.txt", "keep me\n")
+
+      var cfgA = peerConfig(BuddyOne, BuddyTwo, testDir / "a-stores-b", @[syncFolder("folder-a", folderA)])
+      var third: BuddyInfo
+      third.id = newBuddyId(BuddyThree, "peer-3333")
+      third.storagePath = testDir / "a-stores-c"
+      cfgA.buddies.add(third)
+      cfgA.folders[0].buddies = @[]
+      let cfgB = peerConfig(BuddyTwo, BuddyOne, testDir / "b-stores", @[syncFolder("folder-b", testDir / "b")])
+      let cfgC = peerConfig(BuddyThree, BuddyOne, testDir / "c-stores", @[syncFolder("folder-c", testDir / "c")])
+
+      syncPair(cfgA, BuddyTwo, cfgB)
+      syncPair(cfgA, BuddyThree, cfgC)
+      removeFile(folderA / "doomed.txt")
+      syncPair(cfgA, BuddyTwo, cfgB)            # B hears of the delete
+      cfgA.folders[0].name = "renamed"
+      syncPair(cfgA, BuddyThree, cfgC)          # C has not yet
+
+      check not fileExists(folderA / "doomed.txt")
+      check storedFiles(testDir / "c-stores" / "folder-a", ".blob").len == 1
+      syncPair(cfgA, BuddyTwo, cfgB)
+      check storedFiles(testDir / "b-stores" / "folder-a", ".blob").len == 1
+
+  test "an index kept under the folder's name and path still drives deletes":
+    withTestDir("session_legacy_index"):
+      let folderA = testDir / "a"
+      createDir(folderA)
+      createDir(testDir / "b")
+      writeFile(folderA / "doomed.txt", "delete me\n")
+      let cfgA = peerConfig(BuddyOne, BuddyTwo, testDir / "a-stores", @[syncFolder("folder-a", folderA)])
+      let cfgB = peerConfig(BuddyTwo, BuddyOne, testDir / "b-stores", @[syncFolder("folder-b", testDir / "b")])
+      syncBoth(cfgA, cfgB)
+
+      # Keyed as an older build left it.
+      let db = open(getIndexPath(), "", "", "")
+      db.exec(sql"UPDATE files SET folder = ? WHERE folder = ?",
+        cfgA.folders[0].name & "|" & folderA, indexKey(cfgA.folders[0]))
+      db.close()
+
+      removeFile(folderA / "doomed.txt")
+      syncBoth(cfgA, cfgB)
+      check not fileExists(folderA / "doomed.txt")
+      check storedFiles(testDir / "b-stores" / "folder-a", ".blob").len == 0
+
+  proc syncAs(owner: AppConfig, buddy: AppConfig, machine: string, takeover = false, report: SessionReport = nil) =
+    proc run(): Future[tuple[leftOk: bool, rightOk: bool]] {.async.} =
+      let (left, right) = bridgedConnections(closeTogether = false)
+      defer:
+        await left.close()
+        await right.close()
+      let fut1 = syncBuddyFolders(owner, owner.buddies[0].id.uuid, left, newSyncProtocol(),
+        ownerMachine = machine, takeover = takeover, report = report)
+      let fut2 = syncBuddyFolders(buddy, buddy.buddies[0].id.uuid, right, newSyncProtocol())
+      result.leftOk = await fut1
+      result.rightOk = await fut2
+    let outcome = waitFor run()
+    check outcome.leftOk
+    check outcome.rightOk
+
+  proc twoMachines(testDir: string): tuple[old, new, buddy: AppConfig, oldDir, newDir: string] =
+    ## Two installations with one buddy identity and the same folder (id and
+    ## key), as after recovering onto a new machine.
+    result.oldDir = testDir / "old-machine"
+    result.newDir = testDir / "new-machine"
+    createDir(result.oldDir)
+    createDir(result.newDir)
+    createDir(testDir / "b")
+    let folder = syncFolder("folder-a", result.oldDir)
+    var moved = folder
+    moved.path = result.newDir
+    result.old = peerConfig(BuddyOne, BuddyTwo, testDir / "a-stores", @[folder])
+    result.new = peerConfig(BuddyOne, BuddyTwo, testDir / "a-stores", @[moved])
+    result.buddy = peerConfig(BuddyTwo, BuddyOne, testDir / "b-stores", @[syncFolder("folder-b", testDir / "b")])
+
+  test "a second machine with the same identity is refused":
+    withTestDir("session_second_owner"):
+      let m = twoMachines(testDir)
+      writeFile(m.oldDir / "from-old.txt", "old\n")
+      syncAs(m.old, m.buddy, "machine-old")
+      let stored = testDir / "b-stores" / "folder-a"
+      let before = readBlobs(stored)
+      check before.len == 1
+
+      writeFile(m.newDir / "from-new.txt", "new\n")
+      let report = SessionReport()
+      syncAs(m.new, m.buddy, "machine-new", report = report)
+
+      check report.folders.len == 1
+      check report.folders[0].outcome == foRefused
+      check report.folders[0].reason.len > 0
+      check readBlobs(stored) == before
+      check not fileExists(m.newDir / "from-old.txt")
+      check fileExists(m.newDir / "from-new.txt")
+
+  test "takeover hands the folder to the new machine and refuses the old one":
+    withTestDir("session_takeover"):
+      let m = twoMachines(testDir)
+      writeFile(m.oldDir / "from-old.txt", "old\n")
+      syncAs(m.old, m.buddy, "machine-old")
+      let stored = testDir / "b-stores" / "folder-a"
+
+      syncAs(m.new, m.buddy, "machine-new", takeover = true)
+      # The new machine restores what the old one had backed up.
+      check readFile(m.newDir / "from-old.txt") == "old\n"
+      let afterTakeover = readBlobs(stored)
+
+      writeFile(m.oldDir / "late-change.txt", "old machine is still running\n")
+      syncAs(m.old, m.buddy, "machine-old")
+      check readBlobs(stored) == afterTakeover
+
+      # Without asking again, the new machine keeps owning it.
+      writeFile(m.newDir / "next.txt", "next\n")
+      syncAs(m.new, m.buddy, "machine-new")
+      check readBlobs(stored).len == afterTakeover.len + 1
 
   test "a buddy's file list cannot reach outside its storage folder":
     withTestDir("session_traversal"):
@@ -386,6 +712,73 @@ suite "Session sync":
       check not fileExists(testDir / "b-stores" / "escaped.txt")
       for path in walkDirRec(testDir, relative = true):
         check "escaped" notin path
+
+  proc bytesOf(s: string): seq[byte] =
+    @(s.toOpenArrayByte(0, s.high))
+
+  proc scriptedOwnerSync(cfg: AppConfig, folderId: string, entries: seq[FileEntry],
+      contents: Table[string, string]): bool =
+    ## Plays an owner with one unencrypted folder against the real storage
+    ## side in cfg, serving whatever it asks for from contents.
+    proc run(): Future[bool] {.async.} =
+      let (left, right) = bridgedConnections(closeTogether = false)
+      defer:
+        await left.close()
+        await right.close()
+      let protocol = newSyncProtocol()
+      let syncFut = syncBuddyFolders(cfg, BuddyOne, left, protocol)
+      await protocol.sendMessage(right, newFileList("shared", entries, folderId, encrypted = false))
+      await protocol.sendMessage(right, newSyncDone())
+      discard await protocol.receiveMessage(right)
+      await protocol.sendMessage(right, newListPathsRequest(folderId))
+      discard await protocol.receiveMessage(right)
+      await protocol.sendMessage(right, newSyncDone())
+      while true:
+        let msg = await protocol.receiveMessage(right)
+        if msg.isNone or msg.get().kind != msgFileRequest:
+          break
+        let data = bytesOf(contents.getOrDefault(msg.get().requestPath))
+        await protocol.sendMessage(right, newFileData(data, 0, data.len, true))
+        discard await protocol.receiveMessage(right)
+      await protocol.sendMessage(right, newSessionEnd())
+      discard await protocol.receiveMessage(right)
+      result = await syncFut
+    waitFor run()
+
+  test "a buddy cannot reach outside its storage folder through a symlink":
+    # Unencrypted folders are stored as real files, symlinks included. A link
+    # named like our temp file for another file used to be written through
+    # when that file arrived, and a link listed again as a file with the same
+    # hash had its target's mode and time changed.
+    withTestDir("session_symlink_escape"):
+      let victim = testDir / "victim.txt"
+      writeFile(victim, "original\n")
+      setFilePermissions(victim, {fpUserRead, fpUserWrite})
+      setLastModificationTime(victim, fromUnix(1_000_000))
+      let cfgB = peerConfig(BuddyTwo, BuddyOne, testDir / "b-stores", @[])
+
+      proc fileEntry(path, content: string, mode = 0o644): FileEntry =
+        FileEntry(path: path, encryptedPath: path, size: content.len, mtime: 2_000_000,
+          hash: hashToString(hashBytes(bytesOf(content))), mode: mode)
+      proc linkEntry(path, target: string): FileEntry =
+        FileEntry(path: path, encryptedPath: path, size: target.len, mtime: 2_000_000,
+          hash: hashToString(hashBytes(bytesOf(target))), symlinkTarget: target)
+
+      check scriptedOwnerSync(cfgB, "shared-id",
+        @[fileEntry("a", "first\n"), linkEntry("a.buddytmp", victim), linkEntry("link", victim)],
+        {"a": "first\n"}.toTable)
+      check scriptedOwnerSync(cfgB, "shared-id",
+        @[fileEntry("a", "pwned\n"), fileEntry("link", victim, mode = 0o777)],
+        {"a": "pwned\n", "link": victim}.toTable)
+
+      check readFile(victim) == "original\n"
+      check getFilePermissions(victim) == {fpUserRead, fpUserWrite}
+      check getLastModificationTime(victim).toUnix() == 1_000_000
+      let stored = testDir / "b-stores" / "shared-id"
+      check readFile(stored / "a") == "pwned\n"
+      check not symlinkExists(stored / "a.buddytmp")
+      check not symlinkExists(stored / "link")
+      check readFile(stored / "link") == victim
 
 suite "Stalled buddy":
   test "a buddy that goes silent mid-session is given up on":

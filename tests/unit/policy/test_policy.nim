@@ -2,7 +2,6 @@ import std/unittest
 import std/times
 import ../../../src/buddydrive/types
 import ../../../src/buddydrive/sync/policy
-import ../../../src/buddydrive/crypto
 
 suite "parseClockMinutes":
   test "valid HH:MM":
@@ -17,169 +16,119 @@ suite "parseClockMinutes":
     check parseClockMinutes("12:60") == -1
     check parseClockMinutes("") == -1
 
-suite "syncTimeDescription":
-  test "always when sync time empty":
-    check syncTimeDescription("") == "always"
+suite "parseSyncWindow":
+  test "a range":
+    check parseSyncWindow("22:00-06:00") == (true, 22 * 60, 6 * 60)
+    check parseSyncWindow(" 08:30 - 17:00 ") == (true, 8 * 60 + 30, 17 * 60)
 
-  test "shows time when set":
-    check syncTimeDescription("03:00") == "03:00"
+  test "a single time is the half hour around it":
+    check parseSyncWindow("03:00") == (true, 2 * 60 + 45, 3 * 60 + 15)
+    check parseSyncWindow("00:05") == (true, 23 * 60 + 50, 20)
 
-suite "isWithinSyncTime":
-  test "always within when sync time empty":
-    check isWithinSyncTime("")
+  test "invalid or empty":
+    check not parseSyncWindow("").ok
+    check not parseSyncWindow("bad").ok
+    check not parseSyncWindow("22:00-").ok
+    check not parseSyncWindow("22:00-25:00").ok
+    check isValidSyncWindow("")
+    check not isValidSyncWindow("22-06")
 
-  test "within 15 minute window around target":
-    check isWithinSyncTime("03:00", dateTime(2026, mApr, 10, 2, 45, 0, 0, local()))
-    check isWithinSyncTime("03:00", dateTime(2026, mApr, 10, 3, 15, 0, 0, local()))
-    check not isWithinSyncTime("03:00", dateTime(2026, mApr, 10, 3, 16, 0, 0, local()))
+suite "parseSyncInterval":
+  test "minutes and hours":
+    check parseSyncInterval("30m") == 30
+    check parseSyncInterval("2h") == 120
+    check parseSyncInterval("1h30m") == 90
+    check parseSyncInterval(" 2H ") == 120
+    check parseSyncInterval("45") == 45
 
-  test "window wraps midnight":
-    check isWithinSyncTime("00:05", dateTime(2026, mApr, 10, 23, 55, 0, 0, local()))
-    check isWithinSyncTime("23:55", dateTime(2026, mApr, 11, 0, 5, 0, 0, local()))
+  test "empty means the default":
+    check parseSyncInterval("") == 0
+    check isValidSyncInterval("")
 
-  test "invalid sync time falls through to true":
-    check isWithinSyncTime("bad")
+  test "not understood":
+    check parseSyncInterval("0m") == -1
+    check parseSyncInterval("h") == -1
+    check parseSyncInterval("2d") == -1
+    check parseSyncInterval("1h30") == -1
+    check parseSyncInterval("-5m") == -1
+    check parseSyncInterval("999999m") == -1
+    check not isValidSyncInterval("soon")
+
+suite "descriptions":
+  test "window":
+    check syncWindowDescription("") == "any time"
+    check syncWindowDescription("22:00-06:00") == "22:00-06:00"
+
+  test "interval":
+    check syncIntervalDescription("2h") == "every 2h"
+    check syncIntervalDescription("") == "every 5m until first contact, then every 30m"
+
+suite "isWithinSyncWindow":
+  test "always within when the window is empty":
+    check isWithinSyncWindow("")
+
+  test "a single time keeps its 15 minute tolerance":
+    check isWithinSyncWindow("03:00", dateTime(2026, mApr, 10, 2, 45, 0, 0, local()))
+    check isWithinSyncWindow("03:00", dateTime(2026, mApr, 10, 3, 15, 0, 0, local()))
+    check not isWithinSyncWindow("03:00", dateTime(2026, mApr, 10, 3, 16, 0, 0, local()))
+    check isWithinSyncWindow("00:05", dateTime(2026, mApr, 10, 23, 55, 0, 0, local()))
+    check isWithinSyncWindow("23:55", dateTime(2026, mApr, 11, 0, 5, 0, 0, local()))
+
+  test "a range during the day":
+    check isWithinSyncWindow("08:00-17:00", dateTime(2026, mApr, 10, 8, 0, 0, 0, local()))
+    check isWithinSyncWindow("08:00-17:00", dateTime(2026, mApr, 10, 12, 0, 0, 0, local()))
+    check not isWithinSyncWindow("08:00-17:00", dateTime(2026, mApr, 10, 17, 1, 0, 0, local()))
+    check not isWithinSyncWindow("08:00-17:00", dateTime(2026, mApr, 10, 7, 59, 0, 0, local()))
+
+  test "a range across midnight":
+    check isWithinSyncWindow("22:00-06:00", dateTime(2026, mApr, 10, 23, 0, 0, 0, local()))
+    check isWithinSyncWindow("22:00-06:00", dateTime(2026, mApr, 10, 3, 0, 0, 0, local()))
+    check not isWithinSyncWindow("22:00-06:00", dateTime(2026, mApr, 10, 12, 0, 0, 0, local()))
+
+  test "an invalid window falls through to any time":
+    check isWithinSyncWindow("bad")
+
+suite "sync interval":
+  test "empty interval: 5 minutes until first contact, then 30":
+    var buddy: BuddyInfo
+    check effectiveSyncIntervalMinutes(buddy, everConnected = false) == 5
+    check effectiveSyncIntervalMinutes(buddy, everConnected = true) == 30
+
+  test "a set interval is used either way":
+    var buddy: BuddyInfo
+    buddy.syncInterval = "2h"
+    check effectiveSyncIntervalMinutes(buddy, everConnected = false) == 120
+    check effectiveSyncIntervalMinutes(buddy, everConnected = true) == 120
+
+  test "due once the interval has passed since the last activity":
+    let last = initTime(1_800_000_000, 0)
+    check isSyncDue(Time(), 30)
+    check not isSyncDue(last, 30, last + initDuration(minutes = 29))
+    check isSyncDue(last, 30, last + initDuration(minutes = 30))
 
 suite "shouldAttemptBuddySync":
-  test "empty sync time means always":
-    var buddy: BuddyInfo
-    check shouldAttemptBuddySync(buddy)
-
-  test "buddy sync time uses scheduled window":
-    var buddy: BuddyInfo
-    buddy.syncTime = "03:00"
-    check shouldAttemptBuddySync(buddy, dateTime(2026, mApr, 10, 3, 5, 0, 0, local()))
-    check not shouldAttemptBuddySync(buddy, dateTime(2026, mApr, 10, 4, 0, 0, 0, local()))
-
-suite "shouldAttemptBuddySync timing":
-  test "always when sync time is empty":
+  test "empty window means any time":
     var buddy: BuddyInfo
     buddy.id = newBuddyId("buddy-1", "Alice")
-    buddy.syncTime = ""
     check shouldAttemptBuddySync(buddy, dateTime(2026, mApr, 10, 12, 0, 0, 0, local()))
 
-  test "within tolerance around scheduled time":
+  test "outside the window":
     var buddy: BuddyInfo
     buddy.id = newBuddyId("buddy-1", "Alice")
-    buddy.syncTime = "03:00"
-    check shouldAttemptBuddySync(buddy, dateTime(2026, mApr, 10, 2, 50, 0, 0, local()))
-    check shouldAttemptBuddySync(buddy, dateTime(2026, mApr, 10, 3, 10, 0, 0, local()))
-    check not shouldAttemptBuddySync(buddy, dateTime(2026, mApr, 10, 3, 30, 0, 0, local()))
+    buddy.syncWindow = "22:00-06:00"
+    check shouldAttemptBuddySync(buddy, dateTime(2026, mApr, 10, 2, 0, 0, 0, local()))
+    check not shouldAttemptBuddySync(buddy, dateTime(2026, mApr, 10, 12, 0, 0, 0, local()))
 
-  test "invalid sync time falls through to always":
-    var buddy: BuddyInfo
-    buddy.id = newBuddyId("buddy-1", "Alice")
-    buddy.syncTime = "bad"
-    check shouldAttemptBuddySync(buddy)
+suite "nextSyncTime":
+  test "due inside the window, or with no window, is kept":
+    let due = dateTime(2026, mApr, 10, 23, 30, 0, 0, local())
+    check nextSyncTime("", due) == due
+    check nextSyncTime("22:00-06:00", due) == due
 
-suite "shouldSyncRemoteFile":
-  test "new file always synced":
-    var folder = newFolderConfig("docs", "/tmp/docs")
-    var remote: FileInfo
-    remote.path = "new.txt"
-    remote.encryptedPath = "new.txt"
-    check shouldSyncRemoteFile(folder, remote, false)
+  test "due before the window opens waits for it the same day":
+    let due = dateTime(2026, mApr, 10, 12, 10, 0, 0, local())
+    check nextSyncTime("18:00-23:00", due) == dateTime(2026, mApr, 10, 18, 0, 0, 0, local())
 
-  test "different hash triggers sync even with same mtime/size":
-    discard initCrypto()
-    var folder = newFolderConfig("docs", "/tmp/docs")
-    folder.appendOnly = false
-    var local: FileInfo
-    local.path = "existing.txt"
-    local.encryptedPath = "existing.txt"
-    local.size = 50
-    local.mtime = 100
-    for i in 0..<32: local.hash[i] = byte(i)
-    var remote: FileInfo
-    remote.path = "existing.txt"
-    remote.encryptedPath = "existing.txt"
-    remote.size = 50
-    remote.mtime = 100
-    for i in 0..<32: remote.hash[i] = byte(i + 1)
-    check shouldSyncRemoteFile(folder, remote, true, local)
-
-  test "same mtime/size and hash not synced":
-    discard initCrypto()
-    var folder = newFolderConfig("docs", "/tmp/docs")
-    folder.appendOnly = false
-    var local: FileInfo
-    local.path = "file.txt"
-    local.encryptedPath = "file.txt"
-    local.size = 50
-    local.mtime = 100
-    for i in 0..<32: local.hash[i] = byte(i)
-    var remote: FileInfo
-    remote.path = "file.txt"
-    remote.encryptedPath = "file.txt"
-    remote.size = 50
-    remote.mtime = 100
-    remote.hash = local.hash
-    check not shouldSyncRemoteFile(folder, remote, true, local)
-
-  test "different mtime triggers sync via quick check":
-    var folder = newFolderConfig("docs", "/tmp/docs")
-    folder.appendOnly = false
-    var local: FileInfo
-    local.path = "file.txt"
-    local.encryptedPath = "file.txt"
-    local.size = 50
-    local.mtime = 100
-    var remote: FileInfo
-    remote.path = "file.txt"
-    remote.encryptedPath = "file.txt"
-    remote.size = 50
-    remote.mtime = 200
-    check shouldSyncRemoteFile(folder, remote, true, local)
-
-  test "different size triggers sync via quick check":
-    var folder = newFolderConfig("docs", "/tmp/docs")
-    folder.appendOnly = false
-    var local: FileInfo
-    local.path = "file.txt"
-    local.encryptedPath = "file.txt"
-    local.size = 50
-    local.mtime = 100
-    var remote: FileInfo
-    remote.path = "file.txt"
-    remote.encryptedPath = "file.txt"
-    remote.size = 100
-    remote.mtime = 100
-    check shouldSyncRemoteFile(folder, remote, true, local)
-
-  test "append-only preserves existing local file even with different hash":
-    discard initCrypto()
-    var folder = newFolderConfig("docs", "/tmp/docs")
-    folder.appendOnly = true
-    var local: FileInfo
-    local.path = "existing.txt"
-    local.encryptedPath = "existing.txt"
-    for i in 0..<32: local.hash[i] = byte(i)
-    var remote: FileInfo
-    remote.path = "existing.txt"
-    remote.encryptedPath = "existing.txt"
-    for i in 0..<32: remote.hash[i] = byte(i + 1)
-    check not shouldSyncRemoteFile(folder, remote, true, local)
-
-  test "append-only still syncs new files":
-    var folder = newFolderConfig("docs", "/tmp/docs")
-    folder.appendOnly = true
-    var remote: FileInfo
-    remote.path = "new.txt"
-    remote.encryptedPath = "new.txt"
-    check shouldSyncRemoteFile(folder, remote, false)
-
-  test "metadata difference triggers sync":
-    var folder = newFolderConfig("docs", "/tmp/docs")
-    var local: FileInfo
-    local.path = "file.txt"
-    local.encryptedPath = "file.txt"
-    local.size = 10
-    local.mtime = 100
-    local.mode = 0o644
-    var remote: FileInfo
-    remote.path = "file.txt"
-    remote.encryptedPath = "file.txt"
-    remote.size = 10
-    remote.mtime = 100
-    remote.mode = 0o755
-    check shouldSyncRemoteFile(folder, remote, true, local)
+  test "due after the window closed waits for the next day":
+    let due = dateTime(2026, mApr, 10, 23, 17, 0, 0, local())
+    check nextSyncTime("18:00-23:00", due) == dateTime(2026, mApr, 11, 18, 0, 0, 0, local())

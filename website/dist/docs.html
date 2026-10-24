@@ -72,11 +72,11 @@ nimble build</code></pre>
         </ul>
 
         <h3>Pair With a Buddy</h3>
-        <p><strong>On your machine:</strong></p>
-        <pre><code>buddydrive add-buddy --generate-code</code></pre>
-        <p><strong>On your buddy's machine:</strong></p>
-        <pre><code>buddydrive add-buddy --id &lt;your-buddy-id&gt; --code ABCD-EFGH</code></pre>
-        <p>The pairing code is used for both pairing confirmation and relay fallback.</p>
+        <p>Exchange Buddy IDs first. Then, <strong>on your machine:</strong></p>
+        <pre><code>buddydrive add-buddy --generate-code --id &lt;your-buddys-id&gt;</code></pre>
+        <p>This saves your buddy with a new pairing code and prints the command to send them. <strong>On your buddy's machine:</strong></p>
+        <pre><code>buddydrive add-buddy --id &lt;your-id&gt; --code ABCD-EFGH</code></pre>
+        <p>Both sides must store the same code: it keys discovery and relay fallback for the two of you.</p>
 
         <h3>Add a Folder</h3>
         <pre><code>buddydrive add-folder ~/Documents --name docs</code></pre>
@@ -98,6 +98,7 @@ nimble build</code></pre>
         <pre><code>buddydrive recover
 buddydrive start</code></pre>
         <p>Enter the same 12-word recovery phrase. If relay recovery succeeds, BuddyDrive restores your config locally. Starting the daemon then lets normal sync recreate missing files.</p>
+        <p>Each buddy keeps one machine as the owner of a folder, so two machines with the same identity cannot overwrite each other's backup. <code>recover</code> makes the new machine the owner at each buddy on its next sync; from then on the old machine is refused. If you moved <code>config.toml</code> by hand instead, run <code>buddydrive takeover</code> before starting the daemon.</p>
         <p>Current limitation: the CLI prompts for buddy fallback details if relay recovery fails, but that buddy-backed fetch path is not implemented yet. Recovery works via the relay path only.</p>
 
         <h3>Start the Daemon</h3>
@@ -132,7 +133,7 @@ buddydrive config set relay-region eu</code></pre>
         <h3>Current CLI Limitations</h3>
         <ul>
             <li><code>buddydrive start --daemon</code> is not fully implemented yet</li>
-            <li><code>buddydrive stop</code> is a placeholder command today</li>
+            <li><code>buddydrive stop</code>, <code>Ctrl+C</code> or SIGTERM shut the daemon down cleanly</li>
             <li><code>buddydrive status</code> shows configured state, not live daemon connectivity</li>
             <li><code>buddydrive connect</code> does not perform a manual direct dial yet</li>
             <li><code>buddydrive export-recovery</code> shows stored recovery metadata, not the original 12-word phrase</li>
@@ -176,28 +177,29 @@ buddydrive add-folder &lt;path&gt;           Add folder to sync
 buddydrive remove-folder &lt;name&gt;        Remove folder
 buddydrive list-folders                List configured folders
 buddydrive add-buddy                   Pair with a buddy
-  --generate-code                      Generate pairing code
   --id &lt;buddy-id&gt;                      Buddy ID to pair with
-  --code &lt;code&gt;                        Pairing code from buddy
+  --generate-code                      Generate a code, save it for this buddy
+  --code &lt;code&gt;                        Pairing code your buddy generated
 buddydrive remove-buddy &lt;id&gt;           Remove buddy
 buddydrive list-buddies                List paired buddies
 buddydrive connect &lt;address&gt;           Manual connect placeholder
 buddydrive start                       Start sync daemon
   --port &lt;control-port&gt;                Override control API port
   --daemon                             Accepted but stays foreground
-buddydrive stop                        Stop placeholder command
+buddydrive stop                        Ask the daemon to shut down cleanly
 buddydrive status                      Show configured status
 buddydrive logs                        Show recent logs
 buddydrive setup-recovery              Generate recovery phrase and sync encrypted config
 buddydrive recover                     Restore config from recovery phrase
 buddydrive sync-config                 Manually sync encrypted config to relay/buddies
 buddydrive export-recovery             Show stored recovery metadata
+buddydrive takeover                    Make this machine the owner of your folders at your buddies
 buddydrive help                        Show help</code></pre>
 
         <h3>Examples</h3>
-        <pre><code># Pair with a buddy
-buddydrive add-buddy --generate-code
-buddydrive add-buddy --id abc123 --code XYZ-789
+        <pre><code># Pair with a buddy (you generate, they enter the same code)
+buddydrive add-buddy --generate-code --id &lt;their-id&gt;
+buddydrive add-buddy --id &lt;your-id&gt; --code ABCD-EFGH   # on their machine
 
 # Add folders
 buddydrive add-folder ~/Photos --name photos

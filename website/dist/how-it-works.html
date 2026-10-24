@@ -189,6 +189,7 @@
             <li>It fetches the encrypted config blob from the relay</li>
             <li>The config is decrypted and saved locally</li>
             <li>Starting the daemon lets normal sync restore missing files</li>
+            <li>On that sync the new machine becomes the owner of its folders at each buddy; the old machine is refused from then on (<code>buddydrive takeover</code> does the same for a config copied by hand)</li>
         </ol>
 
         <h2>Control API</h2>
@@ -204,6 +205,8 @@
                 <tr><td><code>GET /status</code></td><td>Runtime status</td></tr>
                 <tr><td><code>GET /buddies</code></td><td>Buddy list with connection state</td></tr>
                 <tr><td><code>GET /folders</code></td><td>Folder list with sync status</td></tr>
+                <tr><td><code>GET /storage</code></td><td>What each buddy stores here</td></tr>
+                <tr><td><code>GET /sessions</code></td><td>Recent sync sessions and data transferred</td></tr>
                 <tr><td><code>GET /config</code></td><td>Current saved configuration</td></tr>
                 <tr><td><code>GET /logs</code></td><td>Recent log entries</td></tr>
                 <tr><td><code>GET /recovery</code></td><td>Export recovery metadata</td></tr>
@@ -212,7 +215,7 @@
                 <tr><td><code>POST /buddies/pair</code></td><td>Pair buddy through the local API</td></tr>
                 <tr><td><code>POST /buddies/pairing-code</code></td><td>Generate pairing code</td></tr>
                 <tr><td><code>DELETE /buddies/:id</code></td><td>Remove buddy</td></tr>
-                <tr><td><code>POST /sync/:folder</code></td><td>Trigger sync</td></tr>
+                <tr><td><code>POST /sync/:folder</code></td><td>Sync with the folder's buddies now</td></tr>
                 <tr><td><code>POST /config</code></td><td>Update selected config fields</td></tr>
                 <tr><td><code>POST /config/reload</code></td><td>Reload config from disk</td></tr>
                 <tr><td><code>POST /recovery/setup</code></td><td>Generate recovery phrase</td></tr>
@@ -229,7 +232,6 @@
         <h3>Current</h3>
         <ul>
             <li>Sync uses deterministic initiator selection (CGNAT-correct)</li>
-            <li>One buddy per folder today</li>
             <li>Buddy-backed config fetch for <code>recover</code> is not implemented yet (relay path works)</li>
             <li>No delta sync for large files (partial-chunk diffs)</li>
             <li>No selective download</li>

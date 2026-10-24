@@ -99,3 +99,24 @@ suite "Daemon shutdown":
       let exitCode = waitForExit(daemon, 30_000)
       check exitCode == 0
       check not recordPublished(stub.url)
+
+  test "a stop request left from before the start does not stop a new daemon":
+    withTestDir("shutdown_stale_request"):
+      let stub = startKvStub(freePort())
+      defer: stub.stop()
+      writeDaemonConfig(testDir, stub.url)
+      let stale = execCmdEx(quoteShell(ensureCliBinary()) & " stop", env = daemonEnv(testDir), workingDir = testDir)
+      check stale.exitCode == 0
+
+      let daemon = startDaemon(testDir)
+      defer: close(daemon)
+      check waitForRecord(stub.url, 30)
+      sleep(5000)
+      check daemon.running
+      check recordPublished(stub.url)
+
+      terminate(daemon)
+      check waitForExit(daemon, 30_000) == 0
+      let output = daemon.outputStream.readAll()
+      check "Ignoring a stop request left over" in output
+      check output.count("Stopping daemon...") == 1

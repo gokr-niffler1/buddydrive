@@ -9,6 +9,7 @@ import ../../../src/buddydrive/sync/scanner
 import ../../../src/buddydrive/sync/transfer
 import ../../../src/buddydrive/p2p/protocol
 import ../../../src/buddydrive/crypto
+from ../../../src/buddydrive/config import getIndexPath
 import ../../testutils
 
 useIsolatedDataDir("scanner")
@@ -339,6 +340,12 @@ suite "safeJoin":
       check safeJoin(testDir, "a//b").isNone
       check safeJoin(testDir, "./a").isNone
 
+  test "rejects our own temp file names":
+    withTestDir("safejoin_temp"):
+      check safeJoin(testDir, "a.txt" & TempSuffix).isNone
+      check safeJoin(testDir, "d" & TempSuffix & "/a.txt").isNone
+      check safeJoin(testDir, "a.buddytmp.txt").isSome
+
   when defined(posix):
     test "rejects paths through a symlinked directory":
       withTestDir("safejoin_symlink"):
@@ -388,3 +395,17 @@ suite "scanDirectoryStrict":
         defer: setFilePermissions(testDir / "sub", {fpUserRead, fpUserWrite, fpUserExec})
         expect ScannerError:
           discard newFileScanner(newFolderConfig("t", testDir)).scanDirectoryStrict()
+
+    test "a scan that cannot record what it found raises":
+      # The index row is the only record that we held a path; without it a
+      # later delete would look like a file to restore.
+      withTestDir("strict_readonly_index"):
+        writeFile(testDir / "a.txt", "a")
+        newIndex("strict-ro").close()
+        setFilePermissions(getIndexPath(), {fpUserRead})
+        defer: setFilePermissions(getIndexPath(), {fpUserRead, fpUserWrite})
+        let index = newIndex("strict-ro")
+        defer: index.close()
+        let scanner = newFileScanner(newFolderConfig("t", testDir), index)
+        expect ScannerError:
+          discard scanner.scanDirectoryStrict()

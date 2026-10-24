@@ -42,6 +42,8 @@ when isMainModule:
     handleSyncConfig()
   of cmdExportRecovery:
     handleExportRecovery()
+  of cmdTakeover:
+    handleTakeover()
   of cmdHelp, cmdNone:
     printHelp()
   

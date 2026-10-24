@@ -20,6 +20,8 @@ type
     msgPong
     msgSyncDone
     msgSessionEnd
+    msgFolderRefused
+    msgRehash
 
   CompressionKind* = enum
     ckNone = 0
@@ -32,6 +34,8 @@ type
       folderId*: string
       folderEncrypted*: bool
       folderAppendOnly*: bool
+      ownerMachine*: string
+      ownerTakeover*: bool
       files*: seq[FileEntry]
     of msgFileRequest:
       requestPath*: string
@@ -66,6 +70,12 @@ type
       syncFolderName*: string
     of msgSessionEnd:
       discard
+    of msgFolderRefused:
+      refusedFolderId*: string
+      refusedReason*: string
+    of msgRehash:
+      rehashPath*: string
+      rehashHash*: string
   
   FileEntry* = object
     path*: string
@@ -77,7 +87,7 @@ type
     symlinkTarget*: string
 
 const
-  ProtocolVersion*: uint8 = 5
+  ProtocolVersion*: uint8 = 7
   MaxMessageSize*: int = 1024 * 1024 * 30  # 30MB max
   ChunkSize*: int = 64 * 1024  # 64KB chunks
 
@@ -151,6 +161,8 @@ proc encode*(msg: ProtocolMessage): seq[byte] =
     result.addString(msg.folderId)
     result.add(msg.folderEncrypted.byte)
     result.add(msg.folderAppendOnly.byte)
+    result.addString(msg.ownerMachine)
+    result.add(msg.ownerTakeover.byte)
     result.add(msg.files.len.uint32.encodeInt())
     for f in msg.files:
       result.addString(f.path)
@@ -214,12 +226,20 @@ proc encode*(msg: ProtocolMessage): seq[byte] =
   of msgSessionEnd:
     discard
 
+  of msgFolderRefused:
+    result.addString(msg.refusedFolderId)
+    result.addString(msg.refusedReason)
+
+  of msgRehash:
+    result.addString(msg.rehashPath)
+    result.addString(msg.rehashHash)
+
 proc decode*(data: seq[byte]): Result[ProtocolMessage, string] =
   if data.len < 2:
     return err("Message too short")
   
   let kindByte = data[0]
-  if kindByte > ord(msgSessionEnd):
+  if kindByte > ord(high(MessageKind)):
     return err("Invalid message kind: " & $kindByte)
   
   let kind = MessageKind(kindByte)
@@ -252,6 +272,14 @@ proc decode*(data: seq[byte]): Result[ProtocolMessage, string] =
     msg.folderEncrypted = data[pos] != 0
     msg.folderAppendOnly = data[pos + 1] != 0
     pos += 2
+
+    let ownerMachineRes = readString(data, pos)
+    if ownerMachineRes.isErr:
+      return err(ownerMachineRes.error)
+    msg.ownerMachine = ownerMachineRes.get()
+    checkLen(1)
+    msg.ownerTakeover = data[pos] != 0
+    pos += 1
 
     checkLen(4)
     let fileCount = readUint32(data, pos).int
@@ -428,6 +456,26 @@ proc decode*(data: seq[byte]): Result[ProtocolMessage, string] =
 
   of msgSessionEnd:
     discard
+
+  of msgFolderRefused:
+    let refusedFolderIdRes = readString(data, pos)
+    if refusedFolderIdRes.isErr:
+      return err(refusedFolderIdRes.error)
+    msg.refusedFolderId = refusedFolderIdRes.get()
+    let refusedReasonRes = readString(data, pos)
+    if refusedReasonRes.isErr:
+      return err(refusedReasonRes.error)
+    msg.refusedReason = refusedReasonRes.get()
+
+  of msgRehash:
+    let rehashPathRes = readString(data, pos)
+    if rehashPathRes.isErr:
+      return err(rehashPathRes.error)
+    msg.rehashPath = rehashPathRes.get()
+    let rehashHashRes = readString(data, pos)
+    if rehashHashRes.isErr:
+      return err(rehashHashRes.error)
+    msg.rehashHash = rehashHashRes.get()
   
   ok(msg)
 
@@ -437,6 +485,8 @@ proc newFileList*(
     folderId = "",
     encrypted = false,
     appendOnly = false,
+    ownerMachine = "",
+    takeover = false,
 ): ProtocolMessage =
   ProtocolMessage(
     kind: msgFileList,
@@ -444,6 +494,8 @@ proc newFileList*(
     folderId: folderId,
     folderEncrypted: encrypted,
     folderAppendOnly: appendOnly,
+    ownerMachine: ownerMachine,
+    ownerTakeover: takeover,
     files: files,
   )
 
@@ -498,3 +550,13 @@ proc newSessionEnd*(): ProtocolMessage =
   ## still need. Appended to MessageKind so existing kind bytes keep their
   ## values.
   ProtocolMessage(kind: msgSessionEnd)
+
+proc newFolderRefused*(folderId: string, reason: string): ProtocolMessage =
+  ## The storage side will not take this folder from us in this session; both
+  ## sides skip it, so nothing is changed on either.
+  ProtocolMessage(kind: msgFolderRefused, refusedFolderId: folderId, refusedReason: reason)
+
+proc newRehash*(path: string, hash: string): ProtocolMessage =
+  ## Replaces the content hash the storage buddy recorded for a file, without
+  ## sending the file again.
+  ProtocolMessage(kind: msgRehash, rehashPath: path, rehashHash: hash)

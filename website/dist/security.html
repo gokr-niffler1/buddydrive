@@ -111,13 +111,15 @@
         <ul>
             <li>Your original filenames (encrypted with deterministic path encryption)</li>
             <li>Your file contents (encrypted with random nonces per chunk)</li>
+            <li>Whether you have a particular file: the content hashes it keeps are keyed with the folder key, so they cannot be matched against files your buddy already knows</li>
             <li>The encrypted recovery config stored in the relay without your recovery phrase</li>
             <li>Your other buddies' configuration unless you share it with them</li>
         </ul>
         <p>Your buddy <strong>can</strong> see:</p>
         <ul>
+            <li>How many files you back up, and each file's size, modification time and permission bits</li>
+            <li>When a file's content changes (its keyed hash changes)</li>
             <li>The total storage use and sync timing</li>
-            <li>The size of encrypted blobs on disk</li>
         </ul>
         <p>When folder encryption is disabled (<code>encrypted = false</code>):</p>
         <ul>

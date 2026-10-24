@@ -156,6 +156,28 @@ suite "MoveFile message":
     check not decoded.get().folderEncrypted
     check not decoded.get().folderAppendOnly
 
+  test "carries the owner's machine and takeover flag":
+    let decoded = decode(encode(newFileList("docs", @[], "id-1", ownerMachine = "machine-1", takeover = true)))
+    check decoded.isOk
+    check decoded.get().ownerMachine == "machine-1"
+    check decoded.get().ownerTakeover
+
+suite "FolderRefused message":
+  test "round-trip":
+    let decoded = decode(encode(newFolderRefused("id-1", "owned by another machine")))
+    check decoded.isOk
+    check decoded.get().kind == msgFolderRefused
+    check decoded.get().refusedFolderId == "id-1"
+    check decoded.get().refusedReason == "owned by another machine"
+
+suite "Rehash message":
+  test "round-trip":
+    let decoded = decode(encode(newRehash("enc-path", "abc123")))
+    check decoded.isOk
+    check decoded.get().kind == msgRehash
+    check decoded.get().rehashPath == "enc-path"
+    check decoded.get().rehashHash == "abc123"
+
 suite "ListPaths messages":
   test "request round-trip":
     let msg = newListPathsRequest("folder")

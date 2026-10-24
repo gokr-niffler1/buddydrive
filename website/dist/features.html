@@ -112,10 +112,10 @@
 
         <h3>Pairing Code</h3>
         <ol>
-            <li>Generate a pairing code on your machine</li>
+            <li>Generate a pairing code for your buddy; it is saved with them in your config</li>
             <li>Share it with your buddy</li>
-            <li>They store it when adding you as a buddy</li>
-            <li>The same stored code is reused for relay fallback</li>
+            <li>They store the same code when adding you</li>
+            <li>That one shared code keys discovery and relay fallback for the two of you</li>
         </ol>
 
         <h3>Direct Transport Encryption</h3>
@@ -182,7 +182,6 @@
         <h2>Limitations</h2>
         <ul>
             <li>Background sync depends on peers connecting successfully</li>
-            <li>One buddy per folder today</li>
             <li><code>recover</code> restores config from the relay path today; buddy-backed config fetch is not implemented yet</li>
             <li><code>export-recovery</code> shows stored recovery metadata, not the original phrase</li>
             <li><code>init --with-recovery</code> is shown in help but returns an error if used; use <code>init</code> then <code>setup-recovery</code></li>

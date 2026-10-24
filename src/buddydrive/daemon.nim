@@ -13,6 +13,7 @@ import p2p/addrs
 import p2p/discovery
 import p2p/protocol
 import p2p/pairing
+import p2p/messages
 import p2p/rawrelay
 import sync/policy
 import sync/session
@@ -22,12 +23,19 @@ import sync/scanner
 import control
 import nat
 import recovery
+import version
 
 export results
 export node
 
 type
   DaemonError* = object of CatchableError
+
+  FolderMark* = object
+    ## How the last session with one buddy went for one of our folders.
+    status*: string
+    detail*: string
+    lastSynced*: Time
   
   Daemon* = ref object
     config*: AppConfig
@@ -37,18 +45,31 @@ type
     syncProtocol*: SyncProtocol
     buddyConnections*: Table[string, BuddyConnection]
     activeSyncs*: Table[string, bool]
+    requestedSyncs*: Table[string, bool]
+    folderMarks*: Table[string, Table[string, FolderMark]]
+    lastSessionAt*: Table[string, Time]
+    lastAttemptAt*: Table[string, Time]
+    lastContactAt*: Table[string, Time]
+    waitsForBuddy*: Table[string, bool]
+      ## The buddy dials us, as found at the last discovery lookup.
+    syncRequests*: Table[string, SyncRequestState]
+    sessions*: seq[SessionRecord]
+    sessionProtocols*: Table[int, SyncProtocol]
+    nextSessionId*: int
     pendingRelayFallbacks*: Table[string, bool]
     diagnostics*: Table[string, string]
     relayListCache*: RelayListCache
     discoveryLoop*: Future[void]
     statusUpdateFut*: Future[void]
     running*: bool
+    stopping*: bool
     startTime*: Time
     masterKey*: Option[array[32, byte]]
     upnpPort*: int  ## Non-zero if we created a UPnP mapping that needs cleanup
 
 const
-  BuddyDiscoveryInterval* = chronos.seconds(10 * 60)
+  BuddyScheduleTick* = chronos.seconds(60)
+  MaxSessionRecords = 30
   DirectDialAttemptCount = 2
   DirectDialAttemptTimeoutSeconds = 30
   RelayJoinDelaySeconds = 60
@@ -56,6 +77,7 @@ const
   DirectDialAttemptTimeout = chronos.seconds(DirectDialAttemptTimeoutSeconds)
   RelayJoinDelay = chronos.seconds(RelayJoinDelaySeconds)
   RelayFallbackTimeout = chronos.seconds(RelayFallbackTimeoutSeconds)
+  RelayStandbyMinutes = 10
 
 proc newDaemon*(config: AppConfig): Daemon =
   result = Daemon()
@@ -63,6 +85,14 @@ proc newDaemon*(config: AppConfig): Daemon =
   result.running = false
   result.buddyConnections = initTable[string, BuddyConnection]()
   result.activeSyncs = initTable[string, bool]()
+  result.requestedSyncs = initTable[string, bool]()
+  result.folderMarks = initTable[string, Table[string, FolderMark]]()
+  result.lastSessionAt = initTable[string, Time]()
+  result.lastAttemptAt = initTable[string, Time]()
+  result.lastContactAt = initTable[string, Time]()
+  result.waitsForBuddy = initTable[string, bool]()
+  result.syncRequests = initTable[string, SyncRequestState]()
+  result.sessionProtocols = initTable[int, SyncProtocol]()
   result.pendingRelayFallbacks = initTable[string, bool]()
   result.diagnostics = initTable[string, string]()
   result.relayListCache = initRelayListCache()
@@ -97,7 +127,10 @@ proc startupReachabilityDiagnostic(daemon: Daemon) =
   )
 
 proc buddyDiagnosticKey(buddyId: string): string {.raises: [].}
+proc buddySyncIntervalMinutes(daemon: Daemon, buddy: BuddyInfo): int {.gcsafe.}
+proc nextBuddySync(daemon: Daemon, buddy: BuddyInfo): Time {.gcsafe.}
 proc statusUpdateLoop(daemon: Daemon) {.async: (raises: [CancelledError]).}
+proc updateLiveStatus*(daemon: Daemon) {.gcsafe, raises: [].}
 proc connectToBuddyViaRelay(daemon: Daemon, buddyId: string): Future[bool] {.async: (raises: []).}
 
 proc buddySyncDiagnosticKey(buddyId: string): string =
@@ -146,12 +179,12 @@ proc waitAndJoinRelay(daemon: Daemon, buddyId: string) {.async: (raises: []).} =
 
   discard await daemon.attemptRelayFallbackWithin(buddyId, RelayFallbackTimeout)
 
-proc scheduleRelayJoin(daemon: Daemon, buddyId: string, remoteSyncTime: string) =
+proc scheduleRelayJoin(daemon: Daemon, buddyId: string, remoteSyncWindow: string) =
   if daemon.config.relayRegion.len == 0:
     return
   if daemon.pendingRelayFallbacks.getOrDefault(buddyId, false):
     return
-  if not isWithinSyncTime(remoteSyncTime):
+  if not isWithinSyncWindow(remoteSyncWindow):
     return
 
   daemon.logDiagnostic(
@@ -160,18 +193,130 @@ proc scheduleRelayJoin(daemon: Daemon, buddyId: string, remoteSyncTime: string) 
   )
   asyncSpawn daemon.waitAndJoinRelay(buddyId)
 
-proc runBuddySync(daemon: Daemon, bc: BuddyConnection) {.async.} =
+proc markFolder(daemon: Daemon, folderName: string, buddyId: string, status: string, detail = "") =
+  var marks = daemon.folderMarks.getOrDefault(folderName)
+  var mark = marks.getOrDefault(buddyId)
+  mark.status = status
+  mark.detail = detail
+  if status == "synced":
+    mark.lastSynced = getTime()
+  marks[buddyId] = mark
+  daemon.folderMarks[folderName] = marks
+
+proc recordSession(daemon: Daemon, buddyId: string, report: SessionReport, ok: bool) =
+  var reported: seq[string] = @[]
+  for folder in report.folders:
+    reported.add(folder.folderName)
+    case folder.outcome
+    of foSynced: daemon.markFolder(folder.folderName, buddyId, "synced")
+    of foSkipped: daemon.markFolder(folder.folderName, buddyId, "skipped", folder.reason)
+    of foRefused: daemon.markFolder(folder.folderName, buddyId, "refused", folder.reason)
+  if ok:
+    daemon.lastSessionAt[buddyId] = getTime()
+    return
+  for folder in daemon.config.folders:
+    if folder.name notin reported and folderAppliesToBuddy(folder, buddyId):
+      daemon.markFolder(folder.name, buddyId, "failed")
+
+proc beginSessionRecord(daemon: Daemon, bc: BuddyConnection, dialedBy, via: string, outcome = "running"): int =
+  inc daemon.nextSessionId
+  let now = getTime()
+  daemon.sessions.add(SessionRecord(
+    id: daemon.nextSessionId,
+    buddyId: bc.buddyId,
+    buddyName: bc.buddyName,
+    dialedBy: dialedBy,
+    via: via,
+    startedAt: now,
+    endedAt: now,
+    outcome: outcome,
+  ))
+  if daemon.sessions.len > MaxSessionRecords:
+    daemon.sessions.delete(0)
+  if outcome == "running":
+    daemon.lastContactAt[bc.buddyId] = now
+  if daemon.syncRequests.hasKey(bc.buddyId) and daemon.syncRequests[bc.buddyId].state in ["looking up", "dialing"]:
+    daemon.syncRequests[bc.buddyId].state = "connected"
+    daemon.syncRequests[bc.buddyId].updatedAt = now
+  daemon.nextSessionId
+
+proc copyCounters(record: var SessionRecord, protocol: SyncProtocol) =
+  record.bytesSent = protocol.fileBytesSent
+  record.bytesReceived = protocol.fileBytesReceived
+  record.filesSent = protocol.filesSent
+  record.filesReceived = protocol.filesReceived
+
+proc finishSessionRecord(daemon: Daemon, id: int, ok: bool) =
+  let protocol = daemon.sessionProtocols.getOrDefault(id)
+  daemon.sessionProtocols.del(id)
+  for record in daemon.sessions.mitems:
+    if record.id == id:
+      if protocol != nil:
+        record.copyCounters(protocol)
+      record.endedAt = getTime()
+      record.outcome = if ok: "ok" else: "failed"
+
+proc currentSessions*(daemon: Daemon): seq[SessionRecord] =
+  ## The recent sessions, with live counts for those still running.
+  result = daemon.sessions
+  for record in result.mitems:
+    let protocol = daemon.sessionProtocols.getOrDefault(record.id)
+    if protocol != nil:
+      record.copyCounters(protocol)
+
+proc loadSessionHistory(daemon: Daemon) =
+  ## A session still running when the daemon last stopped was cut off.
+  {.cast(gcsafe).}:
+    try:
+      daemon.sessions = readSessions()
+    except CatchableError as e:
+      echo "Could not read the sync history: ", e.msg
+  for record in daemon.sessions.mitems:
+    if record.outcome == "running":
+      record.outcome = "interrupted"
+    daemon.nextSessionId = max(daemon.nextSessionId, record.id)
+    if record.outcome != "turned away" and record.startedAt > daemon.lastContactAt.getOrDefault(record.buddyId):
+      daemon.lastContactAt[record.buddyId] = record.startedAt
+
+proc endSession(daemon: Daemon, bc: BuddyConnection) {.async.} =
+  ## A connection carries one session. Dropping it afterwards lets the next
+  ## discovery round, or a sync request, dial the buddy again.
+  if daemon.buddyConnections.getOrDefault(bc.buddyId) == bc:
+    daemon.buddyConnections.del(bc.buddyId)
+  await bc.close()
+
+proc runBuddySync(daemon: Daemon, bc: BuddyConnection, dialedBy: string, via: string) {.async.} =
+  ## The only place a connection becomes the buddy's tracked one: there is
+  ## one exactly while its session runs.
   let diagnosticKey = "buddy-" & bc.buddyId
   if daemon.activeSyncs.getOrDefault(bc.buddyId, false):
+    # Both sides dialed at once; the session already running wins and keeps
+    # its connection tracked.
+    discard daemon.beginSessionRecord(bc, dialedBy, via, "turned away")
+    await bc.close()
     return
 
   daemon.activeSyncs[bc.buddyId] = true
+  daemon.buddyConnections[bc.buddyId] = bc
   defer:
     daemon.activeSyncs[bc.buddyId] = false
 
+  let protocol = newSyncProtocol()
+  let sessionId = daemon.beginSessionRecord(bc, dialedBy, via)
+  daemon.sessionProtocols[sessionId] = protocol
+  let report = SessionReport()
+  var ok = false
   try:
-    if await syncBuddyFolders(daemon.config, bc.buddyId, bc.conn, daemon.syncProtocol):
+    var takeover = false
+    {.cast(gcsafe).}:
+      takeover = bc.buddyId in pendingTakeovers()
+    ok = await syncBuddyFolders(daemon.config, bc.buddyId, bc.conn, protocol, takeover = takeover, report = report)
+    if ok:
       echo "Folder sync finished with: ", bc.buddyName
+      if takeover:
+        {.cast(gcsafe).}:
+          clearTakeover(bc.buddyId)
+        echo "This machine now owns its folders at buddy ", bc.buddyId.shortId()
     else:
       daemon.logDiagnostic(
         diagnosticKey,
@@ -182,6 +327,9 @@ proc runBuddySync(daemon: Daemon, bc: BuddyConnection) {.async.} =
       diagnosticKey,
       "Folder sync errored for buddy " & bc.buddyId.shortId() & ": " & e.msg
     )
+  daemon.recordSession(bc.buddyId, report, ok)
+  daemon.finishSessionRecord(sessionId, ok)
+  await daemon.endSession(bc)
 
 proc handleIncomingConnection*(daemon: Daemon, conn: Connection) {.async.} =
   let bc = newBuddyConnection()
@@ -190,16 +338,16 @@ proc handleIncomingConnection*(daemon: Daemon, conn: Connection) {.async.} =
   let success = await bc.acceptHandshake(daemon.config)
   if success:
     echo "Buddy connected: ", bc.buddyName, " (", bc.buddyId.shortId(), ")"
-    if daemon.buddyConnections.hasKey(bc.buddyId):
-      let existing = daemon.buddyConnections[bc.buddyId]
-      if existing != nil:
-        await existing.close()
-    daemon.buddyConnections[bc.buddyId] = bc
+    if daemon.activeSyncs.getOrDefault(bc.buddyId, false):
+      echo "Turned away ", bc.buddyName, ": a sync with this buddy is already running"
+      discard daemon.beginSessionRecord(bc, "buddy", "direct", "turned away")
+      await bc.close()
+      return
     # libp2p closes an incoming stream as soon as its handler returns, so the
     # session has to run to the end inside the handler.
-    await daemon.runBuddySync(bc)
+    await daemon.runBuddySync(bc, "buddy", "direct")
   else:
-    echo "Rejected connection from unknown buddy"
+    echo "Rejected incoming connection: ", (if bc.failure.len > 0: bc.failure else: "handshake failed")
     await bc.close()
 
 proc mountPairingProtocol*(daemon: Daemon) {.async.} =
@@ -245,7 +393,9 @@ proc reloadConfigIfChanged(daemon: Daemon) {.gcsafe.} =
       echo "Config reload failed: ", e.msg
 
 proc runDiscoveryLoop(daemon: Daemon) {.async.} =
-  while daemon.running:
+  ## Checks stopping as well: a cancellation landing inside connectToBuddies
+  ## is swallowed there, and the loop must still end.
+  while daemon.running and not daemon.stopping:
     try:
       daemon.reloadConfigIfChanged()
       await daemon.connectToBuddies()
@@ -254,7 +404,7 @@ proc runDiscoveryLoop(daemon: Daemon) {.async.} =
     except Exception as e:
       echo "Discovery loop error: ", e.msg
     try:
-      await sleepAsync(BuddyDiscoveryInterval)
+      await sleepAsync(BuddyScheduleTick)
     except CancelledError:
       return
 
@@ -262,8 +412,13 @@ proc start*(daemon: Daemon, controlPort: int = DefaultControlPort): Future[void]
   if daemon.running:
     return
   
-  echo "Starting daemon..."
+  echo "Starting daemon... BuddyDrive ", BuildId, ", wire protocol ", ProtocolVersion
+  # A stop asked for while no daemon ran must not stop this one.
+  {.cast(gcsafe).}:
+    if takeDaemonStopRequest():
+      echo "Ignoring a stop request left over from before this start"
   daemon.repairFolderIdentities()
+  daemon.loadSessionHistory()
 
   for folder in daemon.config.folders:
     cleanupTempFiles(folder.path)
@@ -336,7 +491,8 @@ proc start*(daemon: Daemon, controlPort: int = DefaultControlPort): Future[void]
     daemon.discoveryLoop = daemon.runDiscoveryLoop()
     daemon.statusUpdateFut = statusUpdateLoop(daemon)
     
-    startControlServer(controlPort)
+    {.cast(gcsafe).}:
+      startControlServer(controlPort, lanHosts(daemon.node.getAddrs()))
     
     echo "Daemon started successfully"
   except CatchableError as e:
@@ -346,6 +502,14 @@ proc start*(daemon: Daemon, controlPort: int = DefaultControlPort): Future[void]
 proc stop*(daemon: Daemon): Future[void] {.async: (raises: []).} =
   if not daemon.running:
     return
+  if daemon.stopping:
+    while daemon.running:
+      try:
+        await chronos.sleepAsync(chronos.milliseconds(100))
+      except CancelledError:
+        return
+    return
+  daemon.stopping = true
   
   echo "Stopping daemon..."
   
@@ -386,6 +550,7 @@ proc stop*(daemon: Daemon): Future[void] {.async: (raises: []).} =
       removeUpnpPortMapping(daemon.upnpPort)
       daemon.upnpPort = 0
 
+    daemon.updateLiveStatus()
     daemon.running = false
     echo "Daemon stopped"
   except Exception as e:
@@ -409,26 +574,61 @@ proc getBuddyStatus*(daemon: Daemon): seq[BuddyStatus] =
       let bc = daemon.buddyConnections[buddy.id.uuid]
       if bc.isConnected():
         status.state = csConnected
-        status.latencyMs = int((getTime() - bc.lastActivity).inMilliseconds)
       else:
         status.state = csDisconnected
     else:
       status.state = csDisconnected
     
     status.latencyMs = -1
-    status.lastSync = buddy.addedAt
+    status.lastSync = daemon.lastSessionAt.getOrDefault(buddy.id.uuid)
+    status.intervalMinutes = daemon.buddySyncIntervalMinutes(buddy)
+    status.buddyDials = daemon.waitsForBuddy.getOrDefault(buddy.id.uuid, false)
+    status.nextSync = daemon.nextBuddySync(buddy)
     result.add(status)
 
 proc getFolderStatus*(daemon: Daemon): seq[SyncStatus] =
+  ## One line per folder for the GUIs. A local problem (skipped) outranks a
+  ## buddy refusing the folder, which outranks a session that broke off.
   result = @[]
   for folder in daemon.config.folders:
     var status: SyncStatus
     status.folder = folder.name
-    status.totalBytes = 0
-    status.syncedBytes = 0
-    status.fileCount = 0
-    status.syncedFiles = 0
     status.status = "idle"
+    let marks = daemon.folderMarks.getOrDefault(folder.name)
+    var syncing, synced = false
+    var skipped, refused, failed: seq[string]
+    for buddy in daemon.config.buddies:
+      let buddyId = buddy.id.uuid
+      if not folderAppliesToBuddy(folder, buddyId):
+        continue
+      if daemon.activeSyncs.getOrDefault(buddyId, false):
+        syncing = true
+      if buddyId notin marks:
+        continue
+      let mark = marks[buddyId]
+      if mark.lastSynced > status.lastSync:
+        status.lastSync = mark.lastSynced
+      case mark.status
+      of "synced": synced = true
+      of "skipped":
+        if mark.detail notin skipped:
+          skipped.add(mark.detail)
+      of "refused": refused.add(buddy.id.name & " refused it: " & mark.detail)
+      of "failed": failed.add("the last sync with " & buddy.id.name & " did not finish, see the log")
+      else: discard
+    if syncing:
+      status.status = "syncing"
+    elif skipped.len > 0:
+      status.status = "skipped"
+      status.detail = "not readable: " & skipped.join("; ")
+    elif refused.len > 0:
+      status.status = "refused"
+      status.detail = (refused & failed).join("; ")
+    elif failed.len > 0:
+      status.status = "failed"
+      status.detail = failed.join("; ")
+    elif synced:
+      status.status = "synced"
     result.add(status)
 
 proc updateLiveStatus*(daemon: Daemon) =
@@ -436,14 +636,25 @@ proc updateLiveStatus*(daemon: Daemon) =
     let buddyStatuses = daemon.getBuddyStatus()
     let folderStatuses = daemon.getFolderStatus()
     writeLiveStatus(buddyStatuses, folderStatuses)
+    writeSessions(daemon.currentSessions())
+    writeSyncRequests(toSeq(daemon.syncRequests.values))
   except:
     discard
+
+proc handleSyncRequests*(daemon: Daemon, folderNames: seq[string]) {.gcsafe, raises: [].}
 
 proc statusUpdateLoop(daemon: Daemon) {.async: (raises: [CancelledError]).} =
   while daemon.running:
     if takeDaemonStopRequest():
       asyncSpawn daemon.stop()
       return
+    var requested: seq[string] = @[]
+    try:
+      requested = takeSyncRequests()
+    except Exception:
+      discard
+    if requested.len > 0:
+      daemon.handleSyncRequests(requested)
     daemon.updateLiveStatus()
     await chronos.sleepAsync(chronos.seconds(2))
 
@@ -485,11 +696,10 @@ proc connectToBuddyViaRelay(daemon: Daemon, buddyId: string): Future[bool] {.asy
     if success:
       echo "Relay handshake successful with: ", bc.buddyName, " via ", relayConn.relayAddr
       daemon.diagnostics.del(buddyDiagnosticKey(buddyId))
-      daemon.buddyConnections[bc.buddyId] = bc
-      asyncSpawn daemon.runBuddySync(bc)
+      asyncSpawn daemon.runBuddySync(bc, "us", "relay")
       return true
 
-    echo "Relay handshake failed for buddy: ", buddyId.shortId()
+    echo "Relay handshake failed for buddy: ", buddyId.shortId(), (if bc.failure.len > 0: " (" & bc.failure & ")" else: "")
     await bc.close()
   except Exception as e:
     daemon.logDiagnostic(
@@ -555,11 +765,10 @@ proc connectToBuddy*(daemon: Daemon, buddyId: string, peerId: PeerID, addrs: seq
         echo "Handshake successful with: ", bc.buddyName
         daemon.diagnostics.del(buddyDiagnosticKey(buddyId))
         daemon.diagnostics.del(buddyRelayDiagnosticKey(buddyId))
-        daemon.buddyConnections[bc.buddyId] = bc
-        asyncSpawn daemon.runBuddySync(bc)
+        asyncSpawn daemon.runBuddySync(bc, "us", "direct")
         return true
 
-      echo "Handshake failed with: ", $peerId
+      echo "Handshake failed with: ", $peerId, (if bc.failure.len > 0: " (" & bc.failure & ")" else: "")
       await bc.close()
       return false
     except AsyncTimeoutError:
@@ -586,6 +795,32 @@ proc connectToBuddy*(daemon: Daemon, buddyId: string, peerId: PeerID, addrs: seq
   )
   return false
 
+proc lastBuddyActivity(daemon: Daemon, buddyId: string): Time =
+  max(daemon.lastContactAt.getOrDefault(buddyId), daemon.lastAttemptAt.getOrDefault(buddyId))
+
+proc buddySyncIntervalMinutes(daemon: Daemon, buddy: BuddyInfo): int =
+  ## A buddy that dials us is still looked up and met at the relay every
+  ## RelayStandbyMinutes, whatever our own interval, so its dial can land.
+  let id = buddy.id.uuid
+  result = effectiveSyncIntervalMinutes(buddy, daemon.lastContactAt.getOrDefault(id) != Time())
+  if daemon.waitsForBuddy.getOrDefault(id, false):
+    result = min(result, RelayStandbyMinutes)
+
+proc isBuddySyncDue(daemon: Daemon, buddy: BuddyInfo): bool =
+  isSyncDue(daemon.lastBuddyActivity(buddy.id.uuid), daemon.buddySyncIntervalMinutes(buddy))
+
+proc nextBuddySync(daemon: Daemon, buddy: BuddyInfo): Time =
+  ## Approximate: the scheduler checks once a minute.
+  if buddy.pairingCode.len == 0:
+    return Time()
+  let now = getTime()
+  let last = daemon.lastBuddyActivity(buddy.id.uuid)
+  var due = now
+  if last != Time():
+    due = max(now, last + initDuration(minutes = daemon.buddySyncIntervalMinutes(buddy)))
+  {.cast(gcsafe).}:
+    result = nextSyncTime(buddy.syncWindow, due.local).toTime()
+
 proc connectToBuddies*(daemon: Daemon) {.async: (raises: []).} =
   if not daemon.running:
     return
@@ -598,43 +833,38 @@ proc connectToBuddies*(daemon: Daemon) {.async: (raises: []).} =
   echo "Checking ", daemon.config.buddies.len, " buddies..."
   
   for buddy in daemon.config.buddies:
-    if daemon.buddyConnections.hasKey(buddy.id.uuid):
-      let existing = daemon.buddyConnections.getOrDefault(buddy.id.uuid)
-      if existing == nil:
-        daemon.buddyConnections.del(buddy.id.uuid)
-      elif not existing.isConnected():
-        try:
-          await existing.close()
-        except CatchableError:
-          discard
-        daemon.buddyConnections.del(buddy.id.uuid)
-      else:
-        daemon.diagnostics.del(buddySyncDiagnosticKey(buddy.id.uuid))
-        continue
-    
+    if daemon.activeSyncs.getOrDefault(buddy.id.uuid, false):
+      daemon.diagnostics.del(buddySyncDiagnosticKey(buddy.id.uuid))
+      continue
+
     if buddy.pairingCode.len == 0:
       daemon.logDiagnostic(
         buddyDiagnosticKey(buddy.id.uuid),
         "Buddy " & buddy.id.name & " has no pairing code — cannot discover"
       )
       continue
+
+    if not shouldAttemptBuddySync(buddy):
+      daemon.logDiagnostic(
+        buddySyncDiagnosticKey(buddy.id.uuid),
+        "Buddy " & buddy.id.name & " is outside its sync window (" & syncWindowDescription(buddy.syncWindow) & "); postponing outgoing sync attempt."
+      )
+      continue
+    daemon.diagnostics.del(buddySyncDiagnosticKey(buddy.id.uuid))
+    if not daemon.isBuddySyncDue(buddy):
+      continue
+    daemon.lastAttemptAt[buddy.id.uuid] = getTime()
+
     try:
       let record = daemon.discovery.findBuddy(buddy.pairingCode, buddy.id.uuid)
       if record.isSome:
         let rec = record.get()
-        if not shouldInitiate(daemon.config.buddy.uuid, myPubliclyReachable, buddy.id.uuid, rec):
-          daemon.diagnostics.del(buddySyncDiagnosticKey(buddy.id.uuid))
+        let waits = not shouldInitiate(daemon.config.buddy.uuid, myPubliclyReachable, buddy.id.uuid, rec)
+        daemon.waitsForBuddy[buddy.id.uuid] = waits
+        if waits:
           daemon.scheduleRelayJoin(buddy.id.uuid, rec.syncTime)
           continue
 
-        if not shouldAttemptBuddySync(buddy):
-          daemon.logDiagnostic(
-            buddySyncDiagnosticKey(buddy.id.uuid),
-            "Buddy " & buddy.id.name & " is outside its sync_time (" & syncTimeDescription(buddy.syncTime) & "); postponing outgoing sync attempt."
-          )
-          continue
-
-        daemon.diagnostics.del(buddySyncDiagnosticKey(buddy.id.uuid))
         writeCachedBuddyAddr(buddy.id.uuid, rec.peerId, rec.addresses, rec.relayRegion)
 
         var addrs: seq[MultiAddress] = @[]
@@ -665,18 +895,12 @@ proc connectToBuddies*(daemon: Daemon) {.async: (raises: []).} =
       else:
         let cached = readCachedBuddyAddr(buddy.id.uuid)
         if cached.isSome:
-          if daemon.config.buddy.uuid >= buddy.id.uuid:
-            daemon.scheduleRelayJoin(buddy.id.uuid, buddy.syncTime)
+          let waits = daemon.config.buddy.uuid >= buddy.id.uuid
+          daemon.waitsForBuddy[buddy.id.uuid] = waits
+          if waits:
+            daemon.scheduleRelayJoin(buddy.id.uuid, buddy.syncWindow)
             continue
 
-          if not shouldAttemptBuddySync(buddy):
-            daemon.logDiagnostic(
-              buddySyncDiagnosticKey(buddy.id.uuid),
-              "Buddy " & buddy.id.name & " is outside its sync_time (" & syncTimeDescription(buddy.syncTime) & "); postponing outgoing sync attempt."
-            )
-            continue
-
-          daemon.diagnostics.del(buddySyncDiagnosticKey(buddy.id.uuid))
           var addrs: seq[MultiAddress] = @[]
           for addrStr in cached.get().addresses:
             let maRes = MultiAddress.init(addrStr)
@@ -706,3 +930,73 @@ proc connectToBuddies*(daemon: Daemon) {.async: (raises: []).} =
         buddyDiagnosticKey(buddy.id.uuid),
         "Discovery lookup failed for buddy " & buddy.id.name & ": " & e.msg
       )
+
+proc setSyncRequest(daemon: Daemon, buddy: BuddyInfo, state: string, detail = "", fresh = false) =
+  let now = getTime()
+  var request = daemon.syncRequests.getOrDefault(buddy.id.uuid)
+  if fresh or request.buddyId.len == 0:
+    request = SyncRequestState(buddyId: buddy.id.uuid, requestedAt: now)
+  request.buddyName = buddy.id.name
+  request.state = state
+  request.detail = detail
+  request.updatedAt = now
+  daemon.syncRequests[buddy.id.uuid] = request
+
+proc syncBuddyNow(daemon: Daemon, buddy: BuddyInfo) {.async: (raises: []).} =
+  ## A sync asked for from a GUI: dial the buddy now, whatever its sync
+  ## window and whichever side would normally initiate. A buddy that can only
+  ## be reached the other way round is synced when it next dials us.
+  let buddyId = buddy.id.uuid
+  if daemon.activeSyncs.getOrDefault(buddyId, false):
+    daemon.setSyncRequest(buddy, "already syncing", fresh = true)
+    return
+  if daemon.requestedSyncs.getOrDefault(buddyId, false):
+    return
+  daemon.requestedSyncs[buddyId] = true
+  defer:
+    daemon.requestedSyncs[buddyId] = false
+  daemon.setSyncRequest(buddy, "looking up", fresh = true)
+
+  var peerId = ""
+  var addresses: seq[string] = @[]
+  try:
+    let record =
+      if buddy.pairingCode.len > 0 and daemon.discovery != nil: daemon.discovery.findBuddy(buddy.pairingCode, buddyId)
+      else: none(BuddyRecord)
+    if record.isSome:
+      peerId = record.get().peerId
+      addresses = record.get().addresses
+      writeCachedBuddyAddr(buddyId, peerId, addresses, record.get().relayRegion)
+    else:
+      let cached = readCachedBuddyAddr(buddyId)
+      if cached.isSome:
+        peerId = cached.get().peerId
+        addresses = cached.get().addresses
+  except Exception as e:
+    echo "Sync request for ", buddy.id.name, ": discovery lookup failed: ", e.msg
+
+  let pidRes = PeerID.init(peerId)
+  if pidRes.isErr:
+    echo "Sync request for ", buddy.id.name, ": the buddy has not been found yet"
+    daemon.setSyncRequest(buddy, "not found", "The buddy has not published its address yet. Is its daemon running?")
+    return
+  echo "Sync requested with ", buddy.id.name
+  daemon.setSyncRequest(buddy, "dialing")
+  daemon.lastAttemptAt[buddyId] = getTime()
+  let connected = await daemon.connectToBuddy(buddyId, pidRes.get(), parseAddrs(addresses))
+  if connected:
+    daemon.setSyncRequest(buddy, "connected")
+  elif daemon.syncRequests.getOrDefault(buddyId).state == "dialing":
+    daemon.setSyncRequest(buddy, "unreachable", "Could not connect directly or through the relay. See the log for details.")
+
+proc handleSyncRequests*(daemon: Daemon, folderNames: seq[string]) =
+  var buddyIds: seq[string] = @[]
+  for folder in daemon.config.folders:
+    if folder.name notin folderNames:
+      continue
+    for buddy in daemon.config.buddies:
+      if folderAppliesToBuddy(folder, buddy.id.uuid) and buddy.id.uuid notin buddyIds:
+        buddyIds.add(buddy.id.uuid)
+  for buddy in daemon.config.buddies:
+    if buddy.id.uuid in buddyIds:
+      asyncSpawn daemon.syncBuddyNow(buddy)

@@ -1,4 +1,4 @@
-import std/unittest
+import std/[strutils, unittest]
 import ../../../src/buddydrive/control_web
 
 proc hasPrefix(value: string, prefix: string): bool =
@@ -23,6 +23,14 @@ suite "control_web helpers":
     let raw = "GET /w/abcd1234 HTTP/1.1\r\nHost: example\r\n\r\n"
     let rewritten = rewriteLanRequest(raw, "abcd1234-5678-90ab-cdef-1234567890ab")
     check hasPrefix(rewritten, "GET / HTTP/1.1")
+
+  test "the secret root without a slash redirects to it with one":
+    let uuid = "abcd1234-5678-90ab-cdef-1234567890ab"
+    let redirect = lanRootRedirect("GET /w/abcd1234 HTTP/1.1\r\nHost: example\r\n\r\n", uuid)
+    check hasPrefix(redirect, "HTTP/1.1 301")
+    check "Location: /w/abcd1234/\r\n" in redirect
+    check lanRootRedirect("GET /w/abcd1234/ HTTP/1.1\r\n\r\n", uuid) == ""
+    check lanRootRedirect("GET /w/wrong999 HTTP/1.1\r\n\r\n", uuid) == ""
 
   test "rewriteLanRequest rejects wrong secret":
     let raw = "GET /w/wrong999/folders HTTP/1.1\r\nHost: example\r\n\r\n"

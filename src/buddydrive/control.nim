@@ -7,6 +7,9 @@ import crypto
 import control_web
 import recovery
 import sync/config_sync
+import sync/policy
+import version
+import p2p/messages
 
 const
   DefaultControlPort* = 17521
@@ -14,10 +17,17 @@ const
 var controlStarted = false
 var controlThread: Thread[int]
 var pendingRecoveryWords: seq[string] = @[]
+var storageUsageMaxAge* = initDuration(seconds = 60)
+  ## How long /storage reuses a buddy's totals. The GUI asks every few
+  ## seconds, and counting means walking everything the buddy stores.
+var storageUsageCache = initTable[string, tuple[files: int, bytes: int64, at: Time]]()
 
 proc getStateDb(): DbConn =
   let path = config.getDataDir() / "state.db"
   result = open(path, "", "", "")
+  # The control thread reads while the daemon writes; wait for the other
+  # instead of failing at once.
+  result.exec(sql"PRAGMA busy_timeout = 5000")
   result.exec(sql"""
     CREATE TABLE IF NOT EXISTS runtime_status (
       id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -43,7 +53,47 @@ proc getStateDb(): DbConn =
       synced_bytes INTEGER,
       file_count INTEGER,
       synced_files INTEGER,
-      status TEXT
+      status TEXT,
+      detail TEXT,
+      last_sync TEXT
+    )
+  """)
+  var folderColumns: seq[string] = @[]
+  for row in result.rows(sql"PRAGMA table_info(folder_state)"):
+    folderColumns.add(row[1])
+  for column in ["detail", "last_sync"]:
+    if column notin folderColumns:
+      result.exec(sql("ALTER TABLE folder_state ADD COLUMN " & column & " TEXT"))
+  var buddyColumns: seq[string] = @[]
+  for row in result.rows(sql"PRAGMA table_info(buddy_state)"):
+    buddyColumns.add(row[1])
+  for (column, kind) in [("next_sync", "TEXT"), ("interval_minutes", "INTEGER"), ("buddy_dials", "INTEGER")]:
+    if column notin buddyColumns:
+      result.exec(sql("ALTER TABLE buddy_state ADD COLUMN " & column & " " & kind))
+  result.exec(sql"""
+    CREATE TABLE IF NOT EXISTS sync_sessions (
+      id INTEGER PRIMARY KEY,
+      buddy_id TEXT,
+      buddy_name TEXT,
+      dialed_by TEXT,
+      via TEXT,
+      started_at INTEGER,
+      ended_at INTEGER,
+      outcome TEXT,
+      bytes_sent INTEGER,
+      bytes_received INTEGER,
+      files_sent INTEGER,
+      files_received INTEGER
+    )
+  """)
+  result.exec(sql"""
+    CREATE TABLE IF NOT EXISTS sync_requests (
+      buddy_id TEXT PRIMARY KEY,
+      buddy_name TEXT,
+      requested_at INTEGER,
+      updated_at INTEGER,
+      state TEXT,
+      detail TEXT
     )
   """)
   result.exec(sql"""
@@ -73,6 +123,39 @@ proc takeDaemonStopRequest*(): bool =
     discard
   false
 
+proc getSyncRequestPath*(): string =
+  config.getDataDir() / "sync-request"
+
+proc requestFolderSync*(folderName: string) =
+  ## Picked up by the daemon's status loop, like a stop request.
+  config.ensureDataDir()
+  let f = open(getSyncRequestPath(), fmAppend)
+  try:
+    f.writeLine(folderName)
+  finally:
+    f.close()
+
+proc takeSyncRequests*(): seq[string] =
+  ## The folder names asked for since the last call. The file is renamed
+  ## before reading, so a request written meanwhile lands in a new file.
+  let path = getSyncRequestPath()
+  let taken = path & ".taken"
+  try:
+    if not fileExists(path):
+      return @[]
+    moveFile(path, taken)
+    for line in readFile(taken).splitLines():
+      let name = line.strip()
+      if name.len > 0 and name notin result:
+        result.add(name)
+    removeFile(taken)
+  except CatchableError:
+    discard
+
+proc formatStatusTime(t: Time): string =
+  if t.toUnix() == 0: ""
+  else: t.utc.format("yyyy-MM-dd'T'HH:mm:ss'Z'")
+
 proc writeRuntimeStatus*(peerId: string, addresses: seq[string], startTime: Time, running = true) =
   config.ensureDataDir()
   let db = getStateDb()
@@ -89,21 +172,135 @@ proc writeLiveStatus*(buddyStatuses: seq[BuddyStatus], folderStatuses: seq[SyncS
   config.ensureDataDir()
   let db = getStateDb()
   try:
+    # One transaction, so a reader never sees the tables emptied.
+    db.exec(sql"BEGIN")
     db.exec(sql"DELETE FROM buddy_state")
     for b in buddyStatuses:
       db.exec(sql"""
-        INSERT INTO buddy_state (id, name, state, latency_ms, last_activity)
-        VALUES (?, ?, ?, ?, ?)
-      """, b.id, b.name, $b.state, b.latencyMs, b.lastSync.utc.format("yyyy-MM-dd'T'HH:mm:ss'Z'"))
+        INSERT INTO buddy_state (id, name, state, latency_ms, last_activity, next_sync, interval_minutes, buddy_dials)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      """, b.id, b.name, $b.state, b.latencyMs, formatStatusTime(b.lastSync), formatStatusTime(b.nextSync),
+        b.intervalMinutes, if b.buddyDials: 1 else: 0)
     
     db.exec(sql"DELETE FROM folder_state")
     for f in folderStatuses:
       db.exec(sql"""
-        INSERT INTO folder_state (name, total_bytes, synced_bytes, file_count, synced_files, status)
-        VALUES (?, ?, ?, ?, ?, ?)
-      """, f.folder, f.totalBytes, f.syncedBytes, f.fileCount, f.syncedFiles, f.status)
+        INSERT INTO folder_state (name, total_bytes, synced_bytes, file_count, synced_files, status, detail, last_sync)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      """, f.folder, f.totalBytes, f.syncedBytes, f.fileCount, f.syncedFiles, f.status, f.detail, formatStatusTime(f.lastSync))
+    db.exec(sql"COMMIT")
   finally:
     db.close()
+
+proc writeSessions*(sessions: seq[SessionRecord]) =
+  config.ensureDataDir()
+  let db = getStateDb()
+  try:
+    db.exec(sql"BEGIN")
+    db.exec(sql"DELETE FROM sync_sessions")
+    for r in sessions:
+      db.exec(sql"""
+        INSERT INTO sync_sessions (id, buddy_id, buddy_name, dialed_by, via, started_at, ended_at,
+          outcome, bytes_sent, bytes_received, files_sent, files_received)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      """, r.id, r.buddyId, r.buddyName, r.dialedBy, r.via, r.startedAt.toUnix(), r.endedAt.toUnix(),
+        r.outcome, r.bytesSent, r.bytesReceived, r.filesSent, r.filesReceived)
+    db.exec(sql"COMMIT")
+  finally:
+    db.close()
+
+proc writeSyncRequests*(requests: seq[SyncRequestState]) =
+  config.ensureDataDir()
+  let db = getStateDb()
+  try:
+    db.exec(sql"BEGIN")
+    db.exec(sql"DELETE FROM sync_requests")
+    for r in requests:
+      db.exec(sql"""
+        INSERT INTO sync_requests (buddy_id, buddy_name, requested_at, updated_at, state, detail)
+        VALUES (?, ?, ?, ?, ?, ?)
+      """, r.buddyId, r.buddyName, r.requestedAt.toUnix(), r.updatedAt.toUnix(), r.state, r.detail)
+    db.exec(sql"COMMIT")
+  finally:
+    db.close()
+
+proc readSyncRequests*(): seq[SyncRequestState] =
+  let statePath = config.getDataDir() / "state.db"
+  if not fileExists(statePath):
+    return @[]
+  let db = getStateDb()
+  try:
+    for row in db.rows(sql"SELECT buddy_id, buddy_name, requested_at, updated_at, state, detail FROM sync_requests ORDER BY requested_at DESC"):
+      result.add(SyncRequestState(
+        buddyId: row[0],
+        buddyName: row[1],
+        requestedAt: fromUnix(row[2].parseBiggestInt()),
+        updatedAt: fromUnix(row[3].parseBiggestInt()),
+        state: row[4],
+        detail: row[5],
+      ))
+  finally:
+    db.close()
+
+proc readSessions*(): seq[SessionRecord] =
+  ## Oldest first.
+  let statePath = config.getDataDir() / "state.db"
+  if not fileExists(statePath):
+    return @[]
+  let db = getStateDb()
+  try:
+    for row in db.rows(sql"""
+      SELECT id, buddy_id, buddy_name, dialed_by, via, started_at, ended_at, outcome,
+        bytes_sent, bytes_received, files_sent, files_received
+      FROM sync_sessions ORDER BY id
+    """):
+      result.add(SessionRecord(
+        id: row[0].parseInt(),
+        buddyId: row[1],
+        buddyName: row[2],
+        dialedBy: row[3],
+        via: row[4],
+        startedAt: fromUnix(row[5].parseBiggestInt()),
+        endedAt: fromUnix(row[6].parseBiggestInt()),
+        outcome: row[7],
+        bytesSent: row[8].parseBiggestInt(),
+        bytesReceived: row[9].parseBiggestInt(),
+        filesSent: row[10].parseInt(),
+        filesReceived: row[11].parseInt(),
+      ))
+  finally:
+    db.close()
+
+proc sessionsJson(): JsonNode =
+  var entries: seq[JsonNode] = @[]
+  let sessions = readSessions()
+  for i in countdown(sessions.high, 0):
+    let r = sessions[i]
+    entries.add(%*{
+      "id": r.id,
+      "buddyId": r.buddyId,
+      "buddyName": r.buddyName,
+      "dialedBy": r.dialedBy,
+      "via": r.via,
+      "startedAt": formatStatusTime(r.startedAt),
+      "endedAt": if r.outcome == "running": "" else: formatStatusTime(r.endedAt),
+      "outcome": r.outcome,
+      "bytesSent": r.bytesSent,
+      "bytesReceived": r.bytesReceived,
+      "filesSent": r.filesSent,
+      "filesReceived": r.filesReceived,
+    })
+  var requests: seq[JsonNode] = @[]
+  for r in readSyncRequests():
+    requests.add(%*{
+      "buddyId": r.buddyId,
+      "buddyName": r.buddyName,
+      "requestedAt": formatStatusTime(r.requestedAt),
+      "updatedAt": formatStatusTime(r.updatedAt),
+      "state": r.state,
+      "detail": r.detail,
+    })
+  %*{"sessions": entries, "requests": requests}
 
 type CachedBuddyAddr* = object
   peerId*: string
@@ -172,6 +369,15 @@ proc parseRequest*(raw: string): tuple[httpMethod: string, path: string, body: s
   if parts.len > 1:
     result.body = parts[1]
 
+proc buildJson*(): JsonNode =
+  ## The build of this process, which serves the API inside the daemon.
+  %*{
+    "version": BuddyDriveVersion,
+    "commit": BuildCommit,
+    "builtAt": BuildTime,
+    "protocolVersion": int(ProtocolVersion)
+  }
+
 proc statusJson(): JsonNode =
   let statePath = config.getDataDir() / "state.db"
   if fileExists(statePath):
@@ -196,7 +402,8 @@ proc statusJson(): JsonNode =
           "peerId": peerId,
           "addresses": addresses,
           "syncEnabled": true,
-          "syncWindow": "per-buddy"
+          "syncWindow": "per-buddy",
+          "build": buildJson()
         }
     finally:
       db.close()
@@ -213,7 +420,8 @@ proc statusJson(): JsonNode =
       "peerId": "",
       "addresses": [],
       "syncEnabled": true,
-      "syncWindow": "per-buddy"
+      "syncWindow": "per-buddy",
+      "build": buildJson()
     }
   %*{
     "buddy": {"name": "Unknown", "id": ""},
@@ -223,20 +431,40 @@ proc statusJson(): JsonNode =
     "addresses": []
   }
 
+proc buddyScheduleJson(buddy: BuddyInfo): JsonNode =
+  %*{
+    "syncWindow": buddy.syncWindow,
+    "syncInterval": buddy.syncInterval,
+    "syncIntervalText": syncIntervalDescription(buddy.syncInterval)
+  }
+
 proc buddiesJson(): JsonNode =
+  var configured = initTable[string, BuddyInfo]()
+  if config.configExists():
+    for buddy in config.loadConfig().buddies:
+      configured[buddy.id.uuid] = buddy
   let statePath = config.getDataDir() / "state.db"
   if fileExists(statePath):
     let db = getStateDb()
     try:
       var buddies: seq[JsonNode] = @[]
-      for row in db.rows(sql"SELECT id, name, state, latency_ms, last_activity FROM buddy_state"):
-        buddies.add(%*{
+      for row in db.rows(sql"SELECT id, name, state, latency_ms, last_activity, next_sync, interval_minutes, buddy_dials FROM buddy_state"):
+        var entry = %*{
           "id": row[0],
           "name": row[1],
           "state": row[2],
           "latencyMs": row[3].parseInt(),
-          "lastSync": row[4]
-        })
+          "lastSync": row[4],
+          "nextSync": row[5],
+          "intervalMinutes": (if row[6].len > 0: row[6].parseInt() else: 0),
+          "buddyDials": row[7] == "1"
+        }
+        if row[0] in configured:
+          let buddy = configured[row[0]]
+          entry["name"] = %buddy.id.name
+          for key, value in buddyScheduleJson(buddy):
+            entry[key] = value
+        buddies.add(entry)
       if buddies.len > 0:
         return %*{"buddies": buddies}
     finally:
@@ -247,23 +475,29 @@ proc buddiesJson(): JsonNode =
   let cfg = config.loadConfig()
   var buddies: seq[JsonNode] = @[]
   for buddy in cfg.buddies:
-    buddies.add(%*{
+    var entry = %*{
       "id": buddy.id.uuid,
       "name": buddy.id.name,
       "pairingCode": buddy.pairingCode,
       "state": "disconnected",
       "latencyMs": -1,
-      "lastSync": buddy.addedAt.utc.format("yyyy-MM-dd'T'HH:mm:ss'Z'"),
-      "syncTime": buddy.syncTime
-    })
+      "lastSync": ""
+    }
+    for key, value in buddyScheduleJson(buddy):
+      entry[key] = value
+    buddies.add(entry)
   %*{"buddies": buddies}
 
 proc storageUsage(root: string): tuple[files: int, bytes: int64] =
   if not dirExists(root):
     return
-  for path in walkDirRec(root, relative = false):
-    if path.endsWith(".buddytmp"):
+  for relative in walkDirRec(root, relative = true):
+    if relative.endsWith(".buddytmp"):
       continue
+    if DirSep notin relative and relative.endsWith(".owner"):
+      # Records which machine owns the folder beside it; not a stored file.
+      continue
+    let path = root / relative
     if path.endsWith(".meta"):
       inc result.files
       continue
@@ -274,6 +508,15 @@ proc storageUsage(root: string): tuple[files: int, bytes: int64] =
     if not path.endsWith(".blob"):
       inc result.files
 
+proc cachedStorageUsage(root: string): tuple[files: int, bytes: int64] =
+  let now = getTime()
+  if root in storageUsageCache:
+    let cached = storageUsageCache[root]
+    if now - cached.at < storageUsageMaxAge:
+      return (cached.files, cached.bytes)
+  result = storageUsage(root)
+  storageUsageCache[root] = (result.files, result.bytes, now)
+
 proc storageJson(): JsonNode =
   if not config.configExists():
     return %*{"storage": []}
@@ -281,7 +524,7 @@ proc storageJson(): JsonNode =
   var entries: seq[JsonNode] = @[]
   for buddy in cfg.buddies:
     let root = cfg.buddyStorageRoot(buddy.id.uuid)
-    let usage = storageUsage(root)
+    let usage = cachedStorageUsage(root)
     entries.add(%*{
       "buddyId": buddy.id.uuid,
       "buddyName": buddy.id.name,
@@ -298,13 +541,15 @@ proc foldersJson(): JsonNode =
   if fileExists(statePath):
     let db = getStateDb()
     try:
-      for row in db.rows(sql"SELECT name, total_bytes, synced_bytes, file_count, synced_files, status FROM folder_state"):
+      for row in db.rows(sql"SELECT name, total_bytes, synced_bytes, file_count, synced_files, status, detail, last_sync FROM folder_state"):
         liveFolders[row[0]] = %*{
           "totalBytes": row[1].parseInt(),
           "syncedBytes": row[2].parseInt(),
           "fileCount": row[3].parseInt(),
           "syncedFiles": row[4].parseInt(),
-          "status": row[5]
+          "status": row[5],
+          "detail": row[6],
+          "lastSync": row[7]
         }
     finally:
       db.close()
@@ -326,7 +571,9 @@ proc foldersJson(): JsonNode =
         "syncedBytes": 0,
         "fileCount": 0,
         "syncedFiles": 0,
-        "status": "idle"
+        "status": "idle",
+        "detail": "",
+        "lastSync": ""
       }
     }
     if liveFolders.hasKey(folder.name):
@@ -353,9 +600,9 @@ proc configJson(): JsonNode =
       "id": buddy.id.uuid,
       "name": buddy.id.name,
       "pairing_code": buddy.pairingCode,
-      "sync_time": buddy.syncTime,
-      "addedAt": buddy.addedAt.utc.format("yyyy-MM-dd'T'HH:mm:ss'Z'"),
-      "syncTime": buddy.syncTime
+      "sync_window": buddy.syncWindow,
+      "sync_interval": buddy.syncInterval,
+      "addedAt": buddy.addedAt.utc.format("yyyy-MM-dd'T'HH:mm:ss'Z'")
     })
   %*{
     "buddy": {
@@ -369,6 +616,9 @@ proc configJson(): JsonNode =
       "relay_region": cfg.relayRegion,
       "storage_base_path": cfg.storageBasePath,
       "bandwidth_limit_kbps": cfg.bandwidthLimitKBps
+    },
+    "gui": {
+      "locale": cfg.guiLocale
     },
     "folders": folders,
     "buddies": buddies
@@ -454,6 +704,20 @@ proc removeBuddyById(uuid: string): tuple[status: int, response: JsonNode] =
     return (404, %*{"error": "Buddy not found", "code": "BUDDY_NOT_FOUND"})
   (200, %*{"ok": true})
 
+proc isLocaleTag*(value: string): bool =
+  ## A loose BCP 47 check: the browser decides whether it knows the tag.
+  if value.len == 0:
+    return true
+  if value.len > 35:
+    return false
+  for part in value.split('-'):
+    if part.len == 0 or part.len > 8:
+      return false
+    for c in part:
+      if not c.isAlphaNumeric():
+        return false
+  value[0].isAlphaAscii()
+
 proc updateConfigFromBody(body: string): tuple[status: int, response: JsonNode] =
   let parsed = parseJson(body)
   let oldCfg = config.loadConfig()
@@ -463,6 +727,12 @@ proc updateConfigFromBody(body: string): tuple[status: int, response: JsonNode] 
     let buddy = parsed["buddy"]
     if buddy.hasKey("name"):
       cfg.buddy.name = buddy["name"].getStr(cfg.buddy.name)
+
+  if parsed.hasKey("gui") and parsed["gui"].hasKey("locale"):
+    let locale = parsed["gui"]["locale"].getStr("").strip()
+    if not isLocaleTag(locale):
+      return (400, %*{"error": "Locale must be a language tag such as sv-SE, or empty for the browser's", "code": "INVALID_LOCALE"})
+    cfg.guiLocale = locale
 
   if parsed.hasKey("network"):
     let net = parsed["network"]
@@ -511,7 +781,8 @@ proc updateConfigFromBody(body: string): tuple[status: int, response: JsonNode] 
       var buddy: BuddyInfo
       buddy.id = newBuddyId(buddyId, item{"name"}.getStr(""))
       buddy.pairingCode = item{"pairing_code"}.getStr("")
-      buddy.syncTime = item{"sync_time"}.getStr("")
+      buddy.syncWindow = item{"sync_window"}.getStr(item{"sync_time"}.getStr(""))
+      buddy.syncInterval = item{"sync_interval"}.getStr("")
       buddy.addedAt = getTime()
       for oldBuddy in oldCfg.buddies:
         if oldBuddy.id.uuid == buddyId:
@@ -539,16 +810,34 @@ proc updateConfigFromBody(body: string): tuple[status: int, response: JsonNode] 
 
   (200, %*{"ok": true, "restartRequired": restartRequired})
 
+proc readSchedule(parsed: JsonNode, buddy: var BuddyInfo): string =
+  ## Applies sync_window / sync_interval from a request; the error, if any.
+  if parsed.hasKey("sync_window") or parsed.hasKey("sync_time"):
+    let window = parsed{"sync_window"}.getStr(parsed{"sync_time"}.getStr("")).strip()
+    if not isValidSyncWindow(window):
+      return "Sync window must look like 22:00-06:00, or be empty for any time"
+    buddy.syncWindow = window
+  if parsed.hasKey("sync_interval"):
+    let interval = parsed{"sync_interval"}.getStr("").strip()
+    if not isValidSyncInterval(interval):
+      return "Sync interval must look like 30m, 2h or 1h30m, or be empty for the default"
+    buddy.syncInterval = interval
+  ""
+
 proc pairBuddyFromBody(body: string): tuple[status: int, response: JsonNode] =
   let parsed = parseJson(body)
-  let buddyId = parsed{"buddyId"}.getStr("")
-  let buddyName = parsed{"buddyName"}.getStr("")
-  let code = parsed{"code"}.getStr("")
+  let buddyId = parsed{"buddyId"}.getStr("").strip()
+  let buddyName = parsed{"buddyName"}.getStr("").strip()
+  let code = parsed{"code"}.getStr("").strip()
   
   if buddyId.len == 0 or code.len == 0:
     return (400, %*{"error": "buddyId and code are required", "code": "INVALID_REQUEST"})
+  if buddyName.len == 0:
+    return (400, %*{"error": "A name for the buddy is required", "code": "INVALID_REQUEST"})
   
   var cfg = config.loadConfig()
+  if buddyId == cfg.buddy.uuid:
+    return (400, %*{"error": "That is your own Buddy ID; enter your buddy's", "code": "INVALID_REQUEST"})
   var buddy: BuddyInfo
   let idx = cfg.getBuddy(buddyId)
   if idx >= 0:
@@ -556,13 +845,33 @@ proc pairBuddyFromBody(body: string): tuple[status: int, response: JsonNode] =
   else:
     buddy.id.uuid = buddyId
     buddy.addedAt = getTime()
-  if buddyName.len > 0 or idx < 0:
-    buddy.id.name = buddyName
+  buddy.id.name = buddyName
   buddy.pairingCode = code
-  if parsed.hasKey("sync_time"):
-    buddy.syncTime = parsed{"sync_time"}.getStr("")
+  let error = readSchedule(parsed, buddy)
+  if error.len > 0:
+    return (400, %*{"error": error, "code": "INVALID_SCHEDULE"})
   cfg.addBuddy(buddy)
   (200, %*{"ok": true, "message": "Buddy paired successfully"})
+
+proc updateBuddyFromBody(body: string): tuple[status: int, response: JsonNode] =
+  ## Changes a buddy's name and when we sync with it.
+  let parsed = parseJson(body)
+  var cfg = config.loadConfig()
+  let idx = cfg.getBuddy(parsed{"id"}.getStr(""))
+  if idx < 0:
+    return (404, %*{"error": "Buddy not found", "code": "BUDDY_NOT_FOUND"})
+  var buddy = cfg.buddies[idx]
+  if parsed.hasKey("name"):
+    let name = parsed["name"].getStr("").strip()
+    if name.len == 0:
+      return (400, %*{"error": "A name for the buddy is required", "code": "INVALID_REQUEST"})
+    buddy.id.name = name
+  let error = readSchedule(parsed, buddy)
+  if error.len > 0:
+    return (400, %*{"error": error, "code": "INVALID_SCHEDULE"})
+  cfg.buddies[idx] = buddy
+  config.saveConfig(cfg)
+  (200, %*{"ok": true})
 
 proc setupRecoveryHandler(): tuple[status: int, response: JsonNode] =
   if not config.configExists():
@@ -650,6 +959,51 @@ proc exportRecoveryHandler(): tuple[status: int, response: JsonNode] =
     "enabled": cfg.recovery.enabled
   })
 
+proc daemonRunning(): bool =
+  let statePath = config.getDataDir() / "state.db"
+  if not fileExists(statePath):
+    return false
+  let db = getStateDb()
+  try:
+    db.getValue(sql"SELECT running FROM runtime_status WHERE id = 1") == "1"
+  finally:
+    db.close()
+
+proc requestSyncFor(cfg: AppConfig, folders: seq[FolderConfig]): JsonNode =
+  ## Which buddies the daemon will dial for these folders.
+  var buddies: seq[JsonNode] = @[]
+  var seen: seq[string] = @[]
+  for folder in folders:
+    requestFolderSync(folder.name)
+    for buddy in cfg.buddies:
+      if folderAppliesToBuddy(folder, buddy.id.uuid) and buddy.id.uuid notin seen:
+        seen.add(buddy.id.uuid)
+        buddies.add(%*{"id": buddy.id.uuid, "name": buddy.id.name})
+  %*{
+    "ok": true,
+    "message": "Sync requested",
+    "folders": folders.len,
+    "buddies": buddies,
+    "daemonRunning": daemonRunning()
+  }
+
+proc syncFolderByName(name: string): tuple[status: int, response: JsonNode] =
+  if not config.configExists():
+    return (404, %*{"error": "Folder not found", "code": "NOT_FOUND"})
+  let cfg = config.loadConfig()
+  for folder in cfg.folders:
+    if folder.name == name:
+      var response = requestSyncFor(cfg, @[folder])
+      response["folder"] = %name
+      return (200, response)
+  (404, %*{"error": "Folder not found", "code": "NOT_FOUND"})
+
+proc syncAllFolders(): tuple[status: int, response: JsonNode] =
+  if not config.configExists():
+    return (400, %*{"error": "No config found", "code": "NO_CONFIG"})
+  let cfg = config.loadConfig()
+  (200, requestSyncFor(cfg, cfg.folders))
+
 proc syncConfigHandler(): tuple[status: int, response: JsonNode] =
   if not config.configExists():
     return (400, %*{"error": "No config found", "code": "NO_CONFIG"})
@@ -679,6 +1033,7 @@ proc handleRequest*(raw: string): string =
       of "/buddies": jsonResponse(200, buddiesJson())
       of "/folders": jsonResponse(200, foldersJson())
       of "/storage": jsonResponse(200, storageJson())
+      of "/sessions": jsonResponse(200, sessionsJson())
       of "/config": jsonResponse(200, configJson())
       of "/logs": jsonResponse(200, logsJson())
       of "/recovery":
@@ -690,6 +1045,12 @@ proc handleRequest*(raw: string): string =
       of "/buddies/pairing-code": jsonResponse(200, pairingCodeJson())
       of "/buddies/pair":
         let resp = pairBuddyFromBody(req.body)
+        jsonResponse(resp.status, resp.response)
+      of "/buddies/update":
+        let resp = updateBuddyFromBody(req.body)
+        jsonResponse(resp.status, resp.response)
+      of "/sync":
+        let resp = syncAllFolders()
         jsonResponse(resp.status, resp.response)
       of "/config":
         let resp = updateConfigFromBody(req.body)
@@ -723,7 +1084,8 @@ proc handleRequest*(raw: string): string =
         jsonResponse(200, %*{"ok": true, "message": "Daemon stop requested"})
       else:
         if req.path.startsWith("/sync/"):
-          jsonResponse(200, %*{"ok": true, "message": "Sync started", "folder": req.path[6 .. ^1]})
+          let resp = syncFolderByName(req.path[6 .. ^1])
+          jsonResponse(resp.status, resp.response)
         else:
           jsonResponse(404, %*{"error": "Not found", "code": "NOT_FOUND"})
     of "DELETE":
@@ -746,12 +1108,6 @@ proc controlServerMain(port: int) {.thread.} =
   socket.bindAddr(Port(port), "0.0.0.0")
   socket.listen()
   echo "Control server started on port ", port
-  echo "Web GUI (localhost): http://127.0.0.1:", port, "/"
-  {.cast(gcsafe).}:
-    if config.configExists():
-      let cfg = config.loadConfig()
-      let secret = webSecret(cfg.buddy.uuid)
-      echo "Web GUI (LAN): http://<your-ip>:", port, "/w/", secret, "/"
   while true:
     var client: owned(Socket)
     socket.accept(client)
@@ -767,8 +1123,12 @@ proc controlServerMain(port: int) {.thread.} =
               if not config.configExists():
                 forbiddenResponse
               else:
-                let rewritten = rewriteLanRequest(raw, config.loadConfig().buddy.uuid)
-                if rewritten.len == 0:
+                let uuid = config.loadConfig().buddy.uuid
+                let redirect = lanRootRedirect(raw, uuid)
+                let rewritten = rewriteLanRequest(raw, uuid)
+                if redirect.len > 0:
+                  redirect
+                elif rewritten.len == 0:
                   forbiddenResponse
                 else:
                   handleRequest(rewritten)
@@ -778,13 +1138,27 @@ proc controlServerMain(port: int) {.thread.} =
     finally:
       client.close()
 
-proc startControlServer*(port: int = DefaultControlPort) =
+proc webGuiUrls*(port: int, buddyUuid: string, lanHosts: seq[string]): seq[string] =
+  result.add("http://127.0.0.1:" & $port & "/")
+  let secret = webSecret(buddyUuid)
+  for host in (if lanHosts.len > 0: lanHosts else: @["<your-ip>"]):
+    result.add("http://" & host & ":" & $port & "/w/" & secret & "/")
+
+proc startControlServer*(port: int = DefaultControlPort, lanHosts: seq[string] = @[]) =
   if controlStarted:
     return
   config.ensureDataDir()
   writeFile(config.getDataDir() / "port", $port)
   controlStarted = true
   createThread(controlThread, controlServerMain, port)
+  try:
+    if config.configExists():
+      let urls = webGuiUrls(port, config.loadConfig().buddy.uuid, lanHosts)
+      echo "Web GUI (localhost): ", urls[0]
+      for url in urls[1 .. ^1]:
+        echo "Web GUI (LAN): ", url
+  except Exception as e:
+    echo "Could not read the config to show the web GUI address: ", e.msg
 
 proc stopControlServer*() =
   markControlStopped()

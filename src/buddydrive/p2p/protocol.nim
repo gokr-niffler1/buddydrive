@@ -12,6 +12,12 @@ type
   ProtocolError* = object of CatchableError
 
   SyncProtocol* = ref object
+    ## Counts the file data that passes through it, so one per session
+    ## gives that session's totals.
+    fileBytesSent*: int64
+    fileBytesReceived*: int64
+    filesSent*: int
+    filesReceived*: int
 
 var
   messageIdleTimeout* = chronos.minutes(5)
@@ -68,12 +74,18 @@ proc receiveFramedMessage*(conn: Connection, timeout = messageIdleTimeout): Futu
     return none(ProtocolMessage)
 
 proc sendMessage*(protocol: SyncProtocol, conn: Connection, msg: ProtocolMessage, timeout = messageIdleTimeout): Future[void] {.async.} =
-  discard protocol
   await sendFramedMessage(conn, msg, timeout)
+  if protocol != nil and msg.kind == msgFileData:
+    protocol.fileBytesSent += msg.data.len
+    if msg.done:
+      inc protocol.filesSent
 
 proc receiveMessage*(protocol: SyncProtocol, conn: Connection, timeout = messageIdleTimeout): Future[Option[ProtocolMessage]] {.async.} =
-  discard protocol
-  return await receiveFramedMessage(conn, timeout)
+  result = await receiveFramedMessage(conn, timeout)
+  if protocol != nil and result.isSome and result.get().kind == msgFileData:
+    protocol.fileBytesReceived += result.get().data.len
+    if result.get().done:
+      inc protocol.filesReceived
 
 proc sendPing*(protocol: SyncProtocol, conn: Connection): Future[int64] {.async.} =
   let ping = newPing()

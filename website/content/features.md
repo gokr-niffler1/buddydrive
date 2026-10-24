@@ -165,7 +165,6 @@ Run on servers, NAS boxes, or Raspberry Pi with the CLI only.
 ## Limitations
 
 - Background sync depends on peers connecting successfully
-- One buddy per folder today
 - `recover` restores config from the relay path today; buddy-backed config fetch is not implemented yet
 - `export-recovery` shows stored recovery metadata, not the original phrase
 - `init --with-recovery` is shown in help but returns an error if used; use `init` then `setup-recovery`
