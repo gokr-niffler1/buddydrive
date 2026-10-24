@@ -73,6 +73,7 @@ type
     transfer: FileTransfer
     files: seq[FileInfo]
     backupBuddies: seq[string]
+    restoreUnknown: bool
 
   MoveInstruction = tuple[oldPath: string, newPath: string, hash: string]
 
@@ -166,11 +167,13 @@ proc adoptPlainHashes(transfer: FileTransfer, localFiles: seq[FileInfo], stored:
       held.hash = transfer.wireHash(held.hash)
       result.add((held.encryptedPath, hashToString(held.hash)))
 
-proc computeOwnerPlan(transfer: FileTransfer, localFiles: seq[FileInfo], stored: seq[FileInfo]): OwnerPlan =
+proc computeOwnerPlan(transfer: FileTransfer, localFiles: seq[FileInfo], stored: seq[FileInfo], restoreUnknown: bool): OwnerPlan =
   ## Works out what the storage buddy should change to match us, and what it
   ## holds that we should take back. A stored path we do not have is only
-  ## deleted when our index shows we once held it; otherwise it is restored,
-  ## which is how a lost or new machine gets its files back.
+  ## deleted when our index shows we once held it. Otherwise it is restored
+  ## when restoreUnknown is set (a takeover, after 'recover' or 'takeover'),
+  ## which is how a lost or new machine gets its files back, and ignored in
+  ## every other session, so a buddy cannot put files into our folders.
   var localByPath = initTable[string, FileInfo]()
   var localByHash = initTable[string, FileInfo]()
   var storedByPath = initTable[string, FileInfo]()
@@ -212,7 +215,7 @@ proc computeOwnerPlan(transfer: FileTransfer, localFiles: seq[FileInfo], stored:
     if path in knownPaths:
       if not appendOnly:
         result.deletes.add(path)
-    else:
+    elif restoreUnknown:
       result.restores.add(held)
 
 proc ownerServePhase(folder: OwnedFolder, conn: Connection): Future[bool] {.async.} =
@@ -275,7 +278,7 @@ proc ownerSyncFolder(folder: OwnedFolder, buddyId: string, conn: Connection, rep
       return sessionFailed("could not compare " & folderName & " with the buddy's copy: " & e.msg)
   let plan =
     try:
-      computeOwnerPlan(transfer, wireView(transfer, folder.files), stored)
+      computeOwnerPlan(transfer, wireView(transfer, folder.files), stored, folder.restoreUnknown)
     except CatchableError as e:
       return sessionFailed("could not compare " & folderName & " with the buddy's copy: " & e.msg)
 
@@ -487,7 +490,8 @@ proc syncBuddyFolders*(
     report: SessionReport = nil,
 ): Future[bool] {.async.} =
   ## ownerMachine defaults to this installation's machine id. takeover claims
-  ## our folders at this buddy even if another machine owns them there.
+  ## our folders at this buddy even if another machine owns them there, and
+  ## is the only session that restores files we have no record of.
   ## report, when given, collects the outcome of each of our folders.
   let machine =
     if ownerMachine.len > 0: ownerMachine
@@ -521,6 +525,7 @@ proc syncBuddyFolders*(
         transfer: transfer,
         files: transfer.scanner.scanDirectoryStrict(),
         backupBuddies: backupBuddies(config, folder),
+        restoreUnknown: takeover,
       ))
     except CatchableError as e:
       # Left out of this session entirely, so the buddy keeps its copy as is.

@@ -16,19 +16,19 @@ import ../../support/sync_fixtures
 
 useIsolatedDataDir("session")
 
-proc runBridgeSync(cfg1: AppConfig, cfg2: AppConfig, report: SessionReport = nil): Future[tuple[leftOk: bool, rightOk: bool]] {.async.} =
+proc runBridgeSync(cfg1: AppConfig, cfg2: AppConfig, report: SessionReport = nil, takeover = false): Future[tuple[leftOk: bool, rightOk: bool]] {.async.} =
   let (left, right) = bridgedConnections(closeTogether = false)
   defer:
     await left.close()
     await right.close()
 
-  let fut1 = syncBuddyFolders(cfg1, cfg1.buddies[0].id.uuid, left, newSyncProtocol(), report = report)
+  let fut1 = syncBuddyFolders(cfg1, cfg1.buddies[0].id.uuid, left, newSyncProtocol(), takeover = takeover, report = report)
   let fut2 = syncBuddyFolders(cfg2, cfg2.buddies[0].id.uuid, right, newSyncProtocol())
   result.leftOk = await fut1
   result.rightOk = await fut2
 
-proc syncBoth(cfg1, cfg2: AppConfig, report: SessionReport = nil) =
-  let outcome = waitFor runBridgeSync(cfg1, cfg2, report)
+proc syncBoth(cfg1, cfg2: AppConfig, report: SessionReport = nil, takeover = false) =
+  let outcome = waitFor runBridgeSync(cfg1, cfg2, report, takeover)
   check outcome.leftOk
   check outcome.rightOk
 
@@ -134,7 +134,7 @@ suite "Session sync":
       createDir(restored)
       var replacement = source
       replacement.path = restored
-      syncBoth(peerConfig(BuddyOne, BuddyTwo, testDir / "a-stores", @[replacement]), cfgB)
+      syncBoth(peerConfig(BuddyOne, BuddyTwo, testDir / "a-stores", @[replacement]), cfgB, takeover = true)
 
       check readFile(restored / "plan.txt") == "the plan\n"
       check readFile(restored / "nested" / "deep.bin") == "\x00\x01\x02binary"
@@ -143,6 +143,45 @@ suite "Session sync":
       when defined(posix):
         check symlinkExists(restored / "plan-link")
         check expandSymlink(restored / "plan-link") == "plan.txt"
+
+  test "outside a takeover, files the owner never had are not taken from the buddy":
+    withTestDir("session_no_inject"):
+      let encDir = testDir / "enc"
+      let plainDir = testDir / "plain"
+      createDir(encDir)
+      createDir(plainDir)
+      createDir(testDir / "b")
+      writeFile(encDir / "mine.txt", "mine\n")
+      writeFile(plainDir / "mine.txt", "mine\n")
+
+      let enc = syncFolder("folder-enc", encDir)
+      let plain = syncFolder("folder-plain", plainDir, name = "plain", encrypted = false)
+      let cfgB = peerConfig(BuddyTwo, BuddyOne, testDir / "b-stores", @[syncFolder("folder-b", testDir / "b")])
+      syncBoth(peerConfig(BuddyOne, BuddyTwo, testDir / "a-stores", @[enc, plain]), cfgB)
+
+      # The buddy puts a file of its own into the plain backup.
+      writeFile(testDir / "b-stores" / "folder-plain" / "injected.txt", "from the buddy\n")
+
+      # The owner syncs from a fresh machine without asking for a takeover:
+      # nothing it has no record of is taken, backed up files included.
+      let freshEnc = testDir / "fresh-enc"
+      let freshPlain = testDir / "fresh-plain"
+      createDir(freshEnc)
+      createDir(freshPlain)
+      var movedEnc = enc
+      movedEnc.path = freshEnc
+      var movedPlain = plain
+      movedPlain.path = freshPlain
+      syncBoth(peerConfig(BuddyOne, BuddyTwo, testDir / "a-stores", @[movedEnc, movedPlain]), cfgB)
+      check toSeq(walkDirRec(freshEnc)).len == 0
+      check toSeq(walkDirRec(freshPlain)).len == 0
+
+      # On the original machine a normal sync leaves the injected file out too,
+      # and the buddy keeps its backup of the owner's files.
+      syncBoth(peerConfig(BuddyOne, BuddyTwo, testDir / "a-stores", @[enc, plain]), cfgB)
+      check not fileExists(plainDir / "injected.txt")
+      check readFile(testDir / "b-stores" / "folder-plain" / "mine.txt") == "mine\n"
+      check storedFiles(testDir / "b-stores" / "folder-enc", ".blob").len == 1
 
   test "the buddy is told a keyed content hash, never the plain one":
     withTestDir("session_keyed_hash"):
@@ -197,7 +236,7 @@ suite "Session sync":
       createDir(restored)
       var replacement = source
       replacement.path = restored
-      syncBoth(peerConfig(BuddyOne, BuddyTwo, testDir / "a-stores", @[replacement]), cfgB)
+      syncBoth(peerConfig(BuddyOne, BuddyTwo, testDir / "a-stores", @[replacement]), cfgB, takeover = true)
       check readFile(restored / "old.txt") == "backed up long ago\n"
 
   test "a folder with the same id as another is skipped, not fatal":
@@ -291,7 +330,7 @@ suite "Session sync":
       createDir(restored)
       var replacement = source
       replacement.path = restored
-      syncBoth(peerConfig(BuddyOne, BuddyTwo, testDir / "a-stores", @[replacement]), cfgB)
+      syncBoth(peerConfig(BuddyOne, BuddyTwo, testDir / "a-stores", @[replacement]), cfgB, takeover = true)
       check readFile(restored / "keeper.txt") == "keep me\n"
 
   test "unencrypted folders are stored as plain files":
@@ -454,7 +493,7 @@ suite "Session sync":
       createDir(restored)
       var replacement = source
       replacement.path = restored
-      syncBoth(peerConfig(BuddyOne, BuddyTwo, testDir / "a-stores", @[replacement]), cfgB)
+      syncBoth(peerConfig(BuddyOne, BuddyTwo, testDir / "a-stores", @[replacement]), cfgB, takeover = true)
 
       # One of the two comes back; the damaged one does not, and nothing else breaks.
       var back = 0
