@@ -1,6 +1,6 @@
 [Unit]
 Description=BuddyDrive P2P Folder Sync
-Documentation=https://github.com/anomalyco/buddydrive
+Documentation=https://github.com/gokr/buddydrive
 After=network-online.target
 Wants=network-online.target
 

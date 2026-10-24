@@ -1,13 +1,15 @@
 [NAME]
-buddydrive \- P2P encrypted folder sync for you and your buddies
+buddydrive \- P2P encrypted folder backup for you and your buddies
 
 [DESCRIPTION]
-BuddyDrive is a peer-to-peer encrypted folder synchronization tool that lets you sync folders with friends across the internet, bypassing NATs and firewalls. No cloud. No middleman. Just peer-to-peer encrypted sync.
+BuddyDrive backs up folders to a buddy across the internet, bypassing NATs and firewalls. No cloud. No middleman. Just peer-to-peer encrypted backup.
+.PP
+Each buddy keeps your folders encrypted in a storage folder of their own, so they are storage, not a co-author: they cannot read your file names or your data. The side that owns a folder is the only authority on moves, deletes and restores.
 .PP
 BuddyDrive consists of two main components:
 .TP
 .B buddydrive
-The command-line interface and sync daemon. This is the core component that handles folder synchronization, peer discovery via DHT, NAT traversal, and end-to-end encryption using XChaCha20-Poly1305.
+The command-line interface and sync daemon. This is the core component that handles folder synchronization, peer discovery through the relay API, NAT traversal, and end-to-end encryption using XSalsa20-Poly1305.
 .TP
 .B buddydrive-gui
 A GTK4 desktop application for monitoring and configuration. Provides a graphical interface to view sync status, manage folders and buddies, and configure settings.
@@ -17,24 +19,41 @@ A GTK4 desktop application for monitoring and configuration. Provides a graphica
 .I ~/.buddydrive/config.toml
 Configuration file
 .TP
-.I ~/.buddydrive/buddydrive.db
-SQLite database
+.I ~/.buddydrive/state.db
+Runtime state database
+.TP
+.I ~/.buddydrive/index.db
+File metadata index
+.TP
+.I ~/.buddydrive/storage/
+A buddy's backed-up folders, one directory per buddy and folder id
+
+[ENVIRONMENT]
+.TP
+.B BUDDYDRIVE_CONFIG_DIR
+Directory holding config.toml (default ~/.buddydrive)
+.TP
+.B BUDDYDRIVE_DATA_DIR
+Directory holding state.db, index.db, storage and logs (default: the config dir)
 
 [EXAMPLES]
 .TP
 Initialize BuddyDrive:
 buddydrive init
 .TP
-Add a folder to sync:
+Add a folder to back up:
 buddydrive add-folder ~/Documents --name docs
 .TP
-Generate a pairing code:
-buddydrive add-buddy --generate-code
+Generate a pairing code for a buddy:
+buddydrive add-buddy --generate-code --id <buddy-id>
 .TP
 Start the sync daemon:
 buddydrive start
 .TP
-View sync status:
+Stop it again:
+buddydrive stop
+.TP
+View configured state:
 buddydrive status
 
 [SEE ALSO]

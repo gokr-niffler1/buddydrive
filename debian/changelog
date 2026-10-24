@@ -1,9 +1,9 @@
 buddydrive (0.1.0-1) unstable; urgency=medium
 
   * Initial release
-  - P2P networking with libp2p and DHT discovery
+  - P2P networking with libp2p and relay-API discovery
   - Buddy pairing protocol
-  - File sync with SQLite index
+  - Encrypted folder backup with SQLite index
   - Encryption using libsodium
 
  -- Göran Krampe <goran.krampe@gmail.com>  Wed, 09 Apr 2025 17:00:00 +0200

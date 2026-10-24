@@ -48,15 +48,17 @@ Pair with a friend, family member, or trusted colleague. Keep an offsite copy on
 
 ### Direct Transport Encryption
 
-Direct libp2p peer connections use Noise transport encryption. Folder contents are encrypted with XSalsa20-Poly1305 before being stored on your buddy's machine — they see only opaque encrypted blobs, not your filenames or file data. Relay-backed config backups are encrypted with your recovery master key before upload.
+Direct libp2p peer connections use Noise transport encryption. Folder contents are encrypted with XSalsa20-Poly1305 before being stored on your buddy's machine — they see only opaque encrypted blobs under hashed names, not your filenames or file data. Relay-backed config backups are encrypted with your recovery master key before upload.
 
 ### Recovery Phrase
 
 Set up a 12-word recovery phrase once. BuddyDrive derives a master key from it, syncs an encrypted copy of your config to the relay, and lets you restore config on a replacement machine.
 
-### Automatic Sync
+### Automatic Backup
 
-Changed files sync automatically in the background. File moves are detected via content hashing (no re-upload for renames). If a file is missing locally but still exists on your buddy, the next successful sync restores it with hash verification.
+Changed files are backed up in the background, in a session that runs when the two daemons connect. File moves are detected via content hashing (no re-upload for renames). If a file is missing locally but still exists on your buddy, the next successful session restores it with hash verification — and a file missing on one side is only treated as a delete when that side's index shows it held the path before.
+
+Each buddy's folders are stored in a storage folder of their own, one directory per folder id, so two folders both named `docs` never collide. You own your folders: moves, deletes and restores are your decision, not your buddy's.
 
 ### Append-Only Protection
 
@@ -76,6 +78,6 @@ Mark a folder append-only when you want incoming sync to add missing files witho
 
 ## Get Started
 
-BuddyDrive runs on Linux, macOS, and Windows. Install it on two machines, pair them, set up recovery, and start syncing.
+BuddyDrive builds from source on Linux and macOS. Install it on two machines, pair them with one shared code, set up recovery, and start backing up.
 
 [Download Now](/docs) or read the [full feature list](/features).

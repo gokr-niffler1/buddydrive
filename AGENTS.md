@@ -67,6 +67,11 @@ There is no separate lint or typecheck command. The Nim compiler performs full t
 - `-d:ssl` — enabled in config.nims
 - `-d:gtk4` — enable GTK4 GUI build
 - `-d:chronicles_log_level=ERROR` — set in config.nims
+- macOS: libsodium is linked from `/usr/local/lib` and `/opt/homebrew/lib` (`config.nims`)
+
+Building requires `clang` and `libclang-dev` in addition to `g++`: the libp2p
+dependency tree pulls in `futhark` (via `lz4wrapper`) and `boringssl` (via
+`lsquic`), both of which need a C toolchain at build time.
 
 ## Architecture
 
@@ -328,7 +333,7 @@ builds the `buddydrive` binary that the integration tests shell out to once,
 into `testresults/bin/`, and passes the path in `BUDDYDRIVE_TEST_CLI`.
 
 - **Unit tests**: `tests/unit/*/*.nim` — 17 test files covering config, crypto, recovery, messages, policy, scanner, transfer crash safety, control, control_web, rawrelay, index, pairing, types, config_sync, discovery, session, addrs, storage
-- **Integration tests**: `tests/integration/*.nim` — 6 test files covering CLI flows, config sync e2e, relay fallback, relay file sync, pairing, direct file sync, daemon shutdown
+- **Integration tests**: `tests/integration/*.nim` — 7 test files covering CLI flows, config sync e2e, relay fallback, relay file sync, pairing, direct file sync, daemon shutdown
 
 Integration tests are self-contained: they start their own services in-process
 and fail rather than skip. Never reintroduce a "skip on error" wrapper — it hid

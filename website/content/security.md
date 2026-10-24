@@ -77,7 +77,8 @@ When folder encryption is enabled (default):
 
 Your buddy **cannot** see:
 - Your original filenames (encrypted with deterministic path encryption)
-- Your file contents (encrypted with random nonces per chunk)
+- Your file contents (encrypted with random nonces per chunk; the storage side keeps sealed frames it never opens)
+- The names of those blobs on disk (hashes of the encrypted path, not of the plaintext name)
 - Whether you have a particular file: the content hashes it keeps are keyed with the folder key, so they cannot be matched against files your buddy already knows
 - The encrypted recovery config stored in the relay without your recovery phrase
 - Your other buddies' configuration unless you share it with them

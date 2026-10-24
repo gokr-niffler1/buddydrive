@@ -24,9 +24,10 @@ Your Machine <--direct or relay--> Buddy's Machine
 
 BuddyDrive uses a relay-backed API for peer discovery and libp2p for direct transport. Current connectivity options include direct public TCP connections and relay fallback. Features:
 
-- **Relay API discovery** - find your buddy via pairing-code-derived keys on the relay
+- **Relay API discovery** - find your buddy via pairing-code-derived keys on the relay; each side has its own record, so two buddies never overwrite each other
 - **Deterministic initiator selection** - the side without a public address initiates; if both same reachability, lower buddy UUID initiates
 - **Relay fallback** - available when both peers store the same pairing code for the relationship
+- **Known addresses** - `buddy-addresses` is dialed first, which is enough for two buddies on one LAN with no public IP and no relay
 - **Always accept incoming** - incoming connections from known buddies are accepted regardless of sync time
 - **Yamux multiplexing** - multiple streams over one connection
 
@@ -39,7 +40,9 @@ Once paired and configured, BuddyDrive runs in the background:
 - **Incremental sync** - only transfers what changed
 - **Chunked transfer** - handles large files efficiently
 - **Symlink support** - symlink targets are preserved across sync
-- **Resume-friendly flow** - interrupted transfers can continue
+- **Crash-safe writes** - incoming files land in `.buddytmp`, are flushed, then renamed into place; leftovers are cleaned up on the next start
+- **Per-buddy storage** - a buddy's folders live in a storage folder of their own, one directory per folder id, so same-named folders never collide
+- **Scheduled or on demand** - each connection carries one session and is dropped after it, so the next dial picks up changes. Each buddy has its own sync window and interval, and `POST /sync` asks the daemon to sync now
 
 ### Encrypted Backup
 
@@ -47,8 +50,12 @@ When folder encryption is enabled (the default), filenames and file contents are
 
 - **Deterministic path encryption** — same filename always encrypts to the same ciphertext, enabling move detection without re-uploading
 - **Random content nonces** — each 64KB chunk is encrypted with a fresh random nonce, preventing nonce reuse across file versions
-- **Opaque storage** — your buddy sees only encrypted blobs, not your filenames or file contents
+- **Opaque storage** — your buddy stores `.blob` frames it never opens, under names that are hashes of the encrypted path, so neither the directory listing nor the content reveals your filenames
+- **Owner is authoritative** — only the folder's owner decides moves, deletes and restores; the storage side never deletes on its own
 - **Unencrypted sharing mode** — set `encrypted = false` to share files plaintext for collaboration
+
+Note: the `.meta` sidecar does expose size, mode, mtime, content hash and
+symlink target to the storage side. That is metadata, not content.
 
 ### Restore Missing Files
 
@@ -131,28 +138,28 @@ When both you and your buddy edit the same file:
 
 ### Linux
 
-Build from source today. GTK4 GUI with desktop integration on Linux.
+Build from source. GTK4 GUI with desktop integration on Linux.
 
 ### macOS
 
-Build from source.
-
-### Windows
-
-Build from source.
+Build from source. `config.nims` links libsodium from both Homebrew prefixes (Intel and Apple Silicon).
 
 ### Headless
 
-Run on servers, NAS boxes, or Raspberry Pi with the CLI only.
+Run on servers, NAS boxes, or Raspberry Pi with the CLI only — the web GUI is served from the daemon, so no desktop is needed.
+
+### Windows
+
+Not a supported build target: `crypto.nim` loads `libsodium.so.23` by name, which is Linux-specific. Running under WSL works as a Linux build.
 
 ## Technical Details
 
 ### Built With
 
 - **Nim** - systems programming language
-- **libp2p** - peer-to-peer networking
-- **libsodium** - recovery config encryption helpers
-- **GTK4** - desktop GUI
+- **libp2p** - peer-to-peer networking (Noise security, Yamux muxing)
+- **libsodium** - folder, path and chunk encryption, key derivation
+- **GTK4** - desktop GUI (Linux)
 - **SQLite** - runtime status and file tracking
 
 ### Network Requirements

@@ -2,21 +2,23 @@ Source: buddydrive
 Section: net
 Priority: optional
 Maintainer: Göran Krampe <goran.krampe@gmail.com>
-Build-Depends: debhelper (>= 12), nim (>= 2.0), g++, libsodium-dev, libsqlite3-dev, libgtk-4-dev, pkg-config
+Build-Depends: debhelper (>= 12), nim (>= 2.2.8), g++, clang, libclang-dev, libsodium-dev, libsqlite3-dev, liblz4-dev, libgtk-4-dev, pkg-config
 Standards-Version: 4.5.1
 Homepage: https://github.com/gokr/buddydrive
 
 Package: buddydrive
 Architecture: any
-Depends: ${shlibs:Depends}, ${misc:Depends}, libsodium23, libsqlite3-0, libgtk-4-1
-Description: P2P encrypted folder sync with buddies
- BuddyDrive is a peer-to-peer encrypted folder synchronization tool.
- It allows syncing folders with 1-2 friends across the internet,
- bypassing NATs and firewalls using libp2p.
+Depends: ${shlibs:Depends}, ${misc:Depends}, libsodium23, libsqlite3-0, liblz4-1, libgtk-4-1
+Description: P2P encrypted folder backup with buddies
+ BuddyDrive is a peer-to-peer encrypted folder backup tool. It backs
+ folders up to 1-2 friends across the internet, bypassing NATs and
+ firewalls using libp2p, and keeps them encrypted at the buddy's end.
  .
  Features:
-  - P2P networking with DHT discovery
-  - End-to-end encryption using libsodium
+  - P2P networking with relay-API discovery and relay fallback
+  - Encrypted backup using libsodium (XSalsa20-Poly1305)
+  - Per-buddy storage with per-folder encryption
+  - 12-word recovery phrase and relay-backed config restore
   - SQLite-based file index
   - systemd service support
-  - GTK4 graphical interface
+  - GTK4 graphical interface and an embedded web GUI

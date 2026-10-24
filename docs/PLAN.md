@@ -73,7 +73,7 @@ Build BuddyDrive — a P2P encrypted folder sync tool in Nim that syncs folders 
 
 - libsodium secretbox for content
 - Password-based key derivation
-- Encrypted filename support (exists in crypto.nim but not wired)
+- Encrypted filenames (wired into the transfer path — `encryptedPath` via `encryptPath`)
 
 ### Phase 6: Debian Packaging — COMPLETE
 
@@ -115,9 +115,12 @@ The new sync model (described below) is now **largely implemented**. The origina
 
 - **Buddy-backed config fetch** — `syncConfigToBuddy()` and `fetchConfigFromBuddy()` are not implemented yet. Recovery currently only works via the relay path.
 - **`init --with-recovery`** — Parsed as a CLI flag but does nothing. Use `init` then `setup-recovery` separately.
+- **Connection reuse** — the daemon does not check for an existing transport connection before dialing.
 - **Long-lived CGNAT connections** — The CGNAT side does not yet maintain persistent/keepalive connections. It reconnects on each sync cycle.
 - **Connection upgrade** — When a direct connection arrives and a relay connection already exists for that buddy, the relay connection is not yet automatically replaced.
 - **Large folder listings** — File list exchange uses a single framed message (30MB max). Pagination or streaming is deferred.
+- **`POST /sync/<folder>`** — accepted and answered with `ok`, but it does not start a session; sessions start when peers connect.
+- **Manual direct dial** — `buddydrive connect` only prints guidance.
 
 ---
 
