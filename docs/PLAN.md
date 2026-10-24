@@ -222,21 +222,29 @@ CREATE INDEX idx_encrypted_path ON files(encrypted_path);
 
 The owner index stores `content_hash` (plaintext blake2b) for local change detection and move detection. It does not need a `ciphertext_hash` column — move detection uses the `content_hash` that the owner sends to B in the file list.
 
-### Storage Index (B) — Local SQLite Cache
+### Storage Layout (B) — Self-Describing, No Index Needed
 
-The storage buddy's index is also a cache. It tracks what encrypted blobs B has so it can answer "I already have this content" without re-scanning disk.
+Each buddy gets its own storage root on B's machine, chosen by B:
 
-```sql
-CREATE TABLE files (
-  id INTEGER PRIMARY KEY,
-  encrypted_path TEXT NOT NULL,   -- opaque path on disk
-  content_hash BLOB NOT NULL,    -- as reported by owner (plaintext blake2b)
-  size INTEGER NOT NULL,
-  owner_buddy TEXT NOT NULL,     -- which buddy owns this
-  UNIQUE(encrypted_path, owner_buddy)
-);
-CREATE INDEX idx_content_hash ON files(content_hash, owner_buddy);
+- `[[buddies]] storage_path`, if set
+- otherwise `<storage_base_path>/<buddy-uuid>`, or `~/.buddydrive/storage/<buddy-uuid>` when `storage_base_path` is empty
+
+Each folder that buddy shares lives under `<root>/<folder-id>/`. Folders are keyed by the owner's folder id, never by name, so the owner's `docs` cannot collide with B's own `docs`, and a rename does not orphan anything.
+
+**Encrypted folders** are stored as opaque blobs:
+
 ```
+<root>/<folder-id>/<hh>/<h>.blob   -- the owner's chunks, still sealed
+<root>/<folder-id>/<hh>/<h>.meta   -- JSON: encryptedPath, content hash, size, mtime, mode, sealed symlink target
+```
+
+`<h>` is the first 32 hex characters of blake2b(encrypted path), so file names reveal nothing and stay short (an encrypted path can exceed the 255-byte file name limit). A blob is the sequence of `[u8 compression][u32 plaintext length][u32 payload length][nonce || ciphertext]` frames exactly as the owner sent them; restore streams them back unchanged. A move renames the blob and rewrites the small sidecar. Symlinks have a sidecar only.
+
+**Unencrypted (sharing) folders** are stored as ordinary files at their plaintext paths, so B can browse them.
+
+Every path that arrives from a buddy goes through `safeJoin`, which refuses absolute paths, `.`/`..` components and parents that are symlinks.
+
+The storage side keeps no index: the sidecars are the record, so B's filesystem plus A's folder key is everything a restore needs. (The `storage_files` table in `index.db` is unused.)
 
 B does not compute its own hash of the encrypted blob. Instead, B stores the `content_hash` as reported by A. This is the simplest model: A is the authority on content identity. B trusts A for the hash value. This avoids the problem of ciphertext being non-deterministic (random nonces), which would make any ciphertext-based hash useless for content comparison.
 
@@ -260,7 +268,7 @@ On each scan, the owner:
 
 #### Step 1: Exchange File Lists
 
-Both sides send their file lists for shared folders:
+Both sides send their file lists for shared folders. Each list carries the folder id, display name and the encrypted/append-only flags. For encrypted folders the plaintext path is left empty and symlink targets are sealed:
 
 **Owner → Storage**: list of `(encrypted_path, content_hash, size)` per folder
 **Storage → Owner**: list of `(encrypted_path, content_hash, size)` per folder
@@ -286,6 +294,12 @@ Each side compares its list against the other's:
 Move detection is **owner-authoritative**: A tells B to rename. B does not try to infer moves by matching content hashes on its own. This is the simplest and most secure model — A is the authority on what its files are named and where they live.
 
 For the primary backup use case, the flow is typically one-directional: A pushes to B. But the protocol is symmetric — restore is just A requesting files from B.
+
+#### Step 2½: Who Goes When
+
+After the lists are exchanged, the folders of the buddy with the lower UUID are synced first, then the other buddy's. Per folder, the owner goes first (list paths, moves, deletes, restores, `SyncDone`), then the storage side fetches what it is missing and ends with `SyncDone`. The conversation is strictly alternating, which an unbuffered transport needs.
+
+A stored path the owner does not have is deleted only when the owner's index shows it once held it; otherwise it is restored to the owner. Append-only folders keep their index rows for deleted files, so the archive copy stays at the buddy without coming back.
 
 #### Step 3: Transfer
 

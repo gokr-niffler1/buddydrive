@@ -17,6 +17,7 @@ type
     pairingCode*: string
     addresses*: seq[string]
     syncTime*: string
+    storagePath*: string
     addedAt*: Time
   
   FolderConfig* = object
@@ -69,11 +70,11 @@ type
     ownerBuddy*: string
   
   ConnectionState* = enum
-    csDisconnected
-    csConnecting
-    csConnected
-    csSyncing
-    csError
+    csDisconnected = "disconnected"
+    csConnecting = "connecting"
+    csConnected = "connected"
+    csSyncing = "syncing"
+    csError = "error"
   
   SyncStatus* = object
     folder*: string

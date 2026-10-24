@@ -102,6 +102,60 @@ proc handleRequest(client: Socket) =
   if contentLength > 0:
     body = client.recv(contentLength, timeout = 5000)
 
+  if path.startsWith("/discovery/"):
+    # Discovery records, guarded like the real API: a stored token must match
+    # to replace or delete a live record, and without one the X-HMAC header
+    # must. The stub cannot verify the HMAC itself, only compare it.
+    let recordKey = "discovery:" & path[11 .. ^1]
+    let authKey = "discovery-auth:" & path[11 .. ^1]
+    let hmac = headers.getOrDefault("x-hmac", "")
+    let token = headers.getOrDefault("x-bd-discovery-token", "")
+    proc allowed(storedAuth: string): bool =
+      if storedAuth.len == 0:
+        return false
+      let parts = storedAuth.split('|', 1)
+      if parts[1].len > 0:
+        token.len > 0 and token == parts[1]
+      else:
+        parts[0] == hmac
+    case httpMethod
+    of "PUT":
+      var ok = false
+      withLock storeLock:
+        ok = recordKey notin store or allowed(store.getOrDefault(authKey, ""))
+        if ok:
+          store[recordKey] = body
+          store[authKey] = hmac & "|" & token
+      if ok:
+        respond(client, "201 Created")
+      else:
+        respond(client, "401 Unauthorized")
+    of "GET":
+      var value = ""
+      var found = false
+      withLock storeLock:
+        found = recordKey in store
+        if found:
+          value = store[recordKey]
+      if found:
+        respond(client, "200 OK", value)
+      else:
+        respond(client, "404 Not Found")
+    of "DELETE":
+      var ok = false
+      withLock storeLock:
+        ok = recordKey in store and allowed(store.getOrDefault(authKey, ""))
+        if ok:
+          store.del(recordKey)
+          store.del(authKey)
+      if ok:
+        respond(client, "204 No Content")
+      else:
+        respond(client, "404 Not Found")
+    else:
+      respond(client, "405 Method Not Allowed")
+    return
+
   if not path.startsWith("/kv/"):
     respond(client, "404 Not Found")
     return

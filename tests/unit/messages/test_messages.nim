@@ -141,13 +141,28 @@ suite "MoveFile message":
     check decoded.get().newPath == "new.txt"
     check decoded.get().moveHash == "abc123"
 
+  test "carries folder id and flags":
+    let msg = newFileList("docs", @[], "5eafb7a6-62af-400f-b961-288209be18b8", encrypted = true, appendOnly = true)
+    let decoded = decode(encode(msg))
+    check decoded.isOk
+    check decoded.get().folderName == "docs"
+    check decoded.get().folderId == "5eafb7a6-62af-400f-b961-288209be18b8"
+    check decoded.get().folderEncrypted
+    check decoded.get().folderAppendOnly
+
+  test "flags default to off":
+    let decoded = decode(encode(newFileList("docs", @[])))
+    check decoded.isOk
+    check not decoded.get().folderEncrypted
+    check not decoded.get().folderAppendOnly
+
 suite "ListPaths messages":
   test "request round-trip":
     let msg = newListPathsRequest("folder")
     let decoded = decode(encode(msg))
     check decoded.isOk
     check decoded.get().kind == msgListPathsRequest
-    check decoded.get().listFolderName == "folder"
+    check decoded.get().listFolderId == "folder"
 
   test "response round-trip":
     let msg = newListPathsResponse("folder", @[
@@ -157,7 +172,7 @@ suite "ListPaths messages":
     let decoded = decode(encode(msg))
     check decoded.isOk
     check decoded.get().kind == msgListPathsResponse
-    check decoded.get().listResponseFolderName == "folder"
+    check decoded.get().listResponseFolderId == "folder"
     check decoded.get().listFiles.len == 2
     check decoded.get().listFiles[1].path == "link"
     check decoded.get().listFiles[1].encryptedPath == "enc_link"

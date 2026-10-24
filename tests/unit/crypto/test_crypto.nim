@@ -14,6 +14,31 @@ suite "Crypto initialization":
   test "initCrypto succeeds":
     check initCrypto()
 
+suite "Pairing code":
+  test "format is XXXX-XXXX from the unambiguous alphabet":
+    for _ in 0 ..< 200:
+      let code = generatePairingCode()
+      check code.len == 9
+      check code[4] == '-'
+      for i, c in code:
+        if i != 4:
+          check c in PairingCodeAlphabet
+
+  test "codes do not repeat":
+    var seen: seq[string] = @[]
+    for _ in 0 ..< 1000:
+      let code = generatePairingCode()
+      check code notin seen
+      seen.add(code)
+
+  test "every alphabet character is used":
+    var counts: array[256, int]
+    for _ in 0 ..< 2000:
+      for c in generatePairingCode():
+        inc counts[ord(c)]
+    for c in PairingCodeAlphabet:
+      check counts[ord(c)] > 0
+
 suite "Key generation":
   test "generateKey returns 32 bytes":
     let key = generateKey()

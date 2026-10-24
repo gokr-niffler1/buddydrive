@@ -37,6 +37,15 @@ const api = {
     return res.json();
   },
 
+  async postResult(endpoint, body = {}) {
+    const res = await fetch(BASE_PATH + endpoint, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    return { ok: res.ok, data: await res.json() };
+  },
+
   async del(endpoint) {
     const res = await fetch(BASE_PATH + endpoint, { method: "DELETE" });
     return res.json();
@@ -58,7 +67,24 @@ const formatUptime = (seconds) => {
 };
 
 // Render functions
+let latestFolders = [];
+let latestBuddies = [];
+
+const buddyLabel = (id) => {
+  const buddy = latestBuddies.find((b) => b.id === id);
+  return buddy && buddy.name ? buddy.name : id.substring(0, 8) + "...";
+};
+
+const sharingText = (folder) => {
+  const buddies = folder.buddies || [];
+  const target = buddies.length === 0 ? "all buddies" : buddies.map(buddyLabel).join(", ");
+  const traits = [folder.encrypted ? "encrypted" : "not encrypted"];
+  if (folder.appendOnly) traits.push("append-only");
+  return `Backed up to ${target} · ${traits.join(", ")}`;
+};
+
 const renderFolders = (folders) => {
+  latestFolders = folders;
   dom.foldersList.innerHTML = "";
   dom.foldersEmpty.hidden = folders.length > 0;
 
@@ -76,6 +102,7 @@ const renderFolders = (folders) => {
       <div class="list-item-info">
         <div class="list-item-name">${escHtml(folder.name)}</div>
         <div class="list-item-detail">${escHtml(folder.path)}</div>
+        <div class="list-item-detail">${escHtml(sharingText(folder))}</div>
         <div class="list-item-detail">
           ${escHtml(syncStatus)} &mdash;
           ${formatBytes(syncedBytes)} / ${formatBytes(totalBytes)}
@@ -89,6 +116,7 @@ const renderFolders = (folders) => {
           </div>
         ` : ""}
         <button class="btn btn-small btn-sync" data-folder="${escAttr(folder.name)}">Sync</button>
+        <button class="btn btn-small btn-edit-folder" data-folder-id="${escAttr(folder.id || "")}">Edit</button>
         <button class="btn btn-small btn-danger btn-remove-folder" data-folder="${escAttr(folder.name)}">Remove</button>
       </div>
     `;
@@ -96,7 +124,10 @@ const renderFolders = (folders) => {
   }
 };
 
-const renderBuddies = (buddies) => {
+const renderBuddies = (buddies, storage = []) => {
+  latestBuddies = buddies;
+  const storageById = {};
+  for (const entry of storage) storageById[entry.buddyId] = entry;
   dom.buddiesList.innerHTML = "";
   dom.buddiesEmpty.hidden = buddies.length > 0;
 
@@ -104,6 +135,10 @@ const renderBuddies = (buddies) => {
     const state = buddy.state || "disconnected";
     const shortId = buddy.id ? buddy.id.substring(0, 16) + "..." : "";
     const latency = buddy.latencyMs >= 0 ? `${buddy.latencyMs}ms` : "";
+    const stored = storageById[buddy.id];
+    const storedText = stored
+      ? `Storing ${stored.files} files (${formatBytes(stored.bytes)}) in ${stored.path}`
+      : "";
 
     const item = document.createElement("div");
     item.className = "list-item";
@@ -111,6 +146,7 @@ const renderBuddies = (buddies) => {
       <div class="list-item-info">
         <div class="list-item-name">${escHtml(buddy.name || "Unknown")}</div>
         <div class="list-item-detail">${escHtml(shortId)}</div>
+        ${storedText ? `<div class="list-item-detail">${escHtml(storedText)}</div>` : ""}
       </div>
       <div class="list-item-right">
         ${latency ? `<span class="dim">${latency}</span>` : ""}
@@ -166,14 +202,15 @@ const escAttr = (str) => escHtml(str).replace(/"/g, "&quot;");
 // Refresh all data
 const refresh = async () => {
   try {
-    const [status, folders, buddies] = await Promise.all([
+    const [status, folders, buddies, storage] = await Promise.all([
       api.get("/status"),
       api.get("/folders"),
       api.get("/buddies"),
+      api.get("/storage").catch(() => ({ storage: [] })),
     ]);
     renderStatus(status);
     renderFolders(folders.folders || []);
-    renderBuddies(buddies.buddies || []);
+    renderBuddies(buddies.buddies || [], storage.storage || []);
   } catch (e) {
     console.error("Refresh failed:", e);
   }
@@ -240,8 +277,15 @@ const initEvents = () => {
     const syncBtn = e.target.closest(".btn-sync");
     if (syncBtn) {
       const name = syncBtn.dataset.folder;
-      await api.post(`/sync/${name}`);
+      await api.post(`/sync/${encodeURIComponent(name)}`);
       await refresh();
+      return;
+    }
+
+    const editBtn = e.target.closest(".btn-edit-folder");
+    if (editBtn) {
+      const folder = latestFolders.find((f) => f.id === editBtn.dataset.folderId);
+      if (folder) openFolderDialog(folder);
       return;
     }
 
@@ -249,7 +293,7 @@ const initEvents = () => {
     if (removeBtn) {
       const name = removeBtn.dataset.folder;
       if (confirm(`Remove folder "${name}"?`)) {
-        await api.del(`/folders/${name}`);
+        await api.del(`/folders/${encodeURIComponent(name)}`);
         await refresh();
       }
     }
@@ -261,19 +305,43 @@ const initEvents = () => {
     if (removeBtn) {
       const id = removeBtn.dataset.buddy;
       if (confirm("Remove this buddy?")) {
-        await api.del(`/buddies/${id}`);
+        await api.del(`/buddies/${encodeURIComponent(id)}`);
         await refresh();
       }
     }
   });
 
-  // Add Folder dialog
-  document.getElementById("btn-add-folder").addEventListener("click", () => {
-    document.getElementById("folder-name").value = "";
-    document.getElementById("folder-path").value = "";
-    document.getElementById("folder-encrypt").checked = true;
+  // Add / Edit Folder dialog
+  const openFolderDialog = (folder = null) => {
+    const editing = folder !== null;
+    document.getElementById("folder-dialog-title").textContent = editing ? "Edit Folder" : "Add Folder";
+    document.getElementById("btn-submit-folder").textContent = editing ? "Save" : "Add";
+    document.getElementById("folder-id").value = editing ? folder.id : "";
+    document.getElementById("folder-name").value = editing ? folder.name : "";
+    document.getElementById("folder-path").value = editing ? folder.path : "";
+    const encrypt = document.getElementById("folder-encrypt");
+    encrypt.checked = editing ? folder.encrypted : true;
+    // Switching encryption on an existing folder would orphan its backup.
+    encrypt.disabled = editing;
+    document.getElementById("folder-append-only").checked = editing ? !!folder.appendOnly : false;
+    document.getElementById("folder-error").hidden = true;
+
+    const selected = new Set(editing ? folder.buddies || [] : []);
+    const container = document.getElementById("folder-buddies");
+    container.innerHTML = "";
+    for (const buddy of latestBuddies) {
+      const label = document.createElement("label");
+      label.className = "checkbox-label";
+      label.innerHTML = `<input type="checkbox" value="${escAttr(buddy.id)}" ${selected.has(buddy.id) ? "checked" : ""}> ${escHtml(buddy.name || buddy.id)}`;
+      container.appendChild(label);
+    }
+    document.getElementById("folder-buddies-hint").textContent = latestBuddies.length > 0
+      ? "None selected means all your buddies."
+      : "No buddies paired yet. The folder will be backed up to every buddy you pair with.";
     openDialog("dialog-add-folder");
-  });
+  };
+
+  document.getElementById("btn-add-folder").addEventListener("click", () => openFolderDialog());
 
   document.getElementById("btn-cancel-folder").addEventListener("click", () => {
     closeDialog("dialog-add-folder");
@@ -286,12 +354,23 @@ const initEvents = () => {
 
   document.getElementById("btn-submit-folder").addEventListener("click", async (e) => {
     e.preventDefault();
+    const id = document.getElementById("folder-id").value;
     const name = document.getElementById("folder-name").value.trim();
     const path = document.getElementById("folder-path").value.trim();
     const encrypted = document.getElementById("folder-encrypt").checked;
+    const appendOnly = document.getElementById("folder-append-only").checked;
+    const buddies = [...document.querySelectorAll("#folder-buddies input:checked")].map((input) => input.value);
     if (!name || !path) return;
 
-    await api.post("/folders", { name, path, encrypted });
+    const result = id
+      ? await api.postResult("/folders/update", { id, name, path, appendOnly, buddies })
+      : await api.postResult("/folders", { name, path, encrypted, appendOnly, buddies });
+    if (!result.ok) {
+      const error = document.getElementById("folder-error");
+      error.textContent = result.data.error || "Could not save the folder.";
+      error.hidden = false;
+      return;
+    }
     closeDialog("dialog-add-folder");
     await refresh();
   });
@@ -301,7 +380,17 @@ const initEvents = () => {
     document.getElementById("buddy-id").value = "";
     document.getElementById("buddy-pair-name").value = "";
     document.getElementById("buddy-code").value = "";
+    document.getElementById("pair-hint").textContent =
+      "Enter the code your buddy sent you, or generate one and send it to them. Both of you must use the same code.";
     openDialog("dialog-pair-buddy");
+  });
+
+  document.getElementById("btn-generate-code").addEventListener("click", async () => {
+    const info = await api.post("/buddies/pairing-code");
+    document.getElementById("buddy-code").value = info.pairingCode || "";
+    document.getElementById("pair-hint").textContent =
+      `Send your buddy your Buddy ID ${info.buddyId} and this code, then press Pair. ` +
+      "They enter both in their own Pair dialog.";
   });
 
   document.getElementById("btn-cancel-pair").addEventListener("click", () => {

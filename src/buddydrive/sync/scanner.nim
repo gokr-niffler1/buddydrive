@@ -55,6 +55,23 @@ proc stringToBytes(value: string): seq[byte] =
   for i, c in value:
     result[i] = byte(c)
 
+proc safeJoin*(root: string, relativePath: string): Option[string] =
+  ## Joins a path that came from a buddy onto a local root, refusing anything
+  ## that could land outside it: absolute paths, empty or dot components, and
+  ## parent directories that are symlinks.
+  if relativePath.len == 0 or relativePath.isAbsolute() or '\0' in relativePath:
+    return none(string)
+  let parts = relativePath.split({DirSep, AltSep})
+  for part in parts:
+    if part.len == 0 or part == "." or part == "..":
+      return none(string)
+  var current = root
+  for i in 0 ..< parts.len - 1:
+    current = current / parts[i]
+    if symlinkExists(current):
+      return none(string)
+  some(root / relativePath)
+
 proc newFileScanner*(folder: FolderConfig, index: FileIndex = nil): FileScanner =
   result = FileScanner()
   result.folder = folder
@@ -73,41 +90,48 @@ proc sameCachedSymlink(current: types.FileInfo, cached: types.FileInfo): bool =
   current.mode == cached.mode and
   current.symlinkTarget == cached.symlinkTarget
 
-proc scanFileUsingCache(scanner: FileScanner, path: string): types.FileInfo =
+proc scanFileCached(scanner: FileScanner, path: string): types.FileInfo =
+  ## Scans one file, reusing the cached hash when nothing changed. Raises when
+  ## the file cannot be read.
   let relativePath = path[scanner.rootPath.len..^1]
   if relativePath.startsWith("/") or relativePath.startsWith("\\"):
     result.path = relativePath[1..^1]
   else:
     result.path = relativePath
 
+  if scanner.folder.encrypted and scanner.folder.folderKey.len == KeySize:
+    result.encryptedPath = encryptPath(result.path, scanner.folder.folderKey)
+  else:
+    result.encryptedPath = result.path
+
+  let info = getFileInfo(path, followSymlink = false)
+  result.mode = permissionsToMode(info.permissions)
+  result.mtime = info.lastWriteTime.toUnix()
+
+  let cached = if scanner.index != nil: scanner.index.getFile(result.path) else: none(types.FileInfo)
+  if symlinkExists(path):
+    result.symlinkTarget = expandSymlink(path)
+    result.size = result.symlinkTarget.len.int64
+    if cached.isSome and sameCachedSymlink(result, cached.get()):
+      result.hash = cached.get().hash
+    else:
+      result.hash = hashBytes(stringToBytes(result.symlinkTarget))
+  else:
+    result.size = info.size
+    if cached.isSome and sameCachedRegularFile(result, cached.get()):
+      result.hash = cached.get().hash
+    else:
+      result.hash = hashFileStream(path)
+
+  if scanner.index != nil:
+    scanner.index.cacheScannedFile(result)
+
+proc scanFileUsingCache(scanner: FileScanner, path: string): types.FileInfo =
   try:
-    if scanner.folder.encrypted and scanner.folder.folderKey.len == KeySize:
-      result.encryptedPath = encryptPath(result.path, scanner.folder.folderKey)
-    else:
-      result.encryptedPath = result.path
-
-    let info = getFileInfo(path, followSymlink = false)
-    result.mode = permissionsToMode(info.permissions)
-    result.mtime = info.lastWriteTime.toUnix()
-
-    let cached = if scanner.index != nil: scanner.index.getFile(result.path) else: none(types.FileInfo)
-    if symlinkExists(path):
-      result.symlinkTarget = expandSymlink(path)
-      result.size = result.symlinkTarget.len.int64
-      if cached.isSome and sameCachedSymlink(result, cached.get()):
-        result.hash = cached.get().hash
-      else:
-        result.hash = hashBytes(stringToBytes(result.symlinkTarget))
-    else:
-      result.size = info.size
-      if cached.isSome and sameCachedRegularFile(result, cached.get()):
-        result.hash = cached.get().hash
-      else:
-        result.hash = hashFileStream(path)
-
-    if scanner.index != nil:
-      scanner.index.cacheScannedFile(result)
+    result = scanner.scanFileCached(path)
   except:
+    let relativePath = path[scanner.rootPath.len..^1]
+    result.path = if relativePath.startsWith("/") or relativePath.startsWith("\\"): relativePath[1..^1] else: relativePath
     result.encryptedPath = result.path
     result.size = 0
     result.mtime = 0
@@ -169,6 +193,26 @@ proc scanDirectory*(scanner: FileScanner): seq[types.FileInfo] =
   walkDirNoFollow(scanner.rootPath, paths)
   for path in paths:
     result.add(scanner.scanFileUsingCache(path))
+
+proc scanDirectoryStrict*(scanner: FileScanner): seq[types.FileInfo] =
+  ## Scans everything or nothing. What a sync session sends must be the whole
+  ## folder: a missing root (an unplugged disk) or an unreadable file or
+  ## directory would otherwise look like deleted files and wipe the buddy's
+  ## copy. Raises ScannerError naming what could not be read.
+  if not dirExists(scanner.rootPath):
+    raise newException(ScannerError, "folder not found: " & scanner.rootPath)
+
+  var paths: seq[string] = @[]
+  try:
+    walkDirNoFollow(scanner.rootPath, paths)
+  except Exception as e:
+    raise newException(ScannerError, "cannot list " & scanner.rootPath & ": " & e.msg)
+
+  for path in paths:
+    try:
+      result.add(scanner.scanFileCached(path))
+    except Exception as e:
+      raise newException(ScannerError, "cannot read " & path & ": " & e.msg)
 
 proc scanChanges*(scanner: FileScanner, previous: seq[types.FileInfo]): seq[FileChange] =
   result = @[]

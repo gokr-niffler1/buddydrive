@@ -58,7 +58,8 @@
   <!-- Add Folder Dialog -->
   <dialog id="dialog-add-folder">
     <form method="dialog">
-      <h3>Add Folder</h3>
+      <h3 id="folder-dialog-title">Add Folder</h3>
+      <input type="hidden" id="folder-id">
       <label for="folder-name">Folder name</label>
       <input type="text" id="folder-name" placeholder="My Documents" required>
       <label for="folder-path">Folder path</label>
@@ -67,6 +68,16 @@
         <input type="checkbox" id="folder-encrypt" checked>
         Encrypt folder contents
       </label>
+      <label class="checkbox-label">
+        <input type="checkbox" id="folder-append-only">
+        Append-only (your buddy keeps files you delete)
+      </label>
+      <fieldset id="folder-buddies-fieldset">
+        <legend>Back up to</legend>
+        <div id="folder-buddies"></div>
+        <p class="dim" id="folder-buddies-hint">None selected means all your buddies.</p>
+      </fieldset>
+      <p class="dim" id="folder-error" hidden></p>
       <div class="dialog-actions">
         <button type="button" class="btn" id="btn-cancel-folder">Cancel</button>
         <button type="submit" class="btn btn-primary" id="btn-submit-folder">Add</button>
@@ -83,7 +94,11 @@
       <label for="buddy-pair-name">Buddy name (optional)</label>
       <input type="text" id="buddy-pair-name" placeholder="Friend's name">
       <label for="buddy-code">Pairing code</label>
-      <input type="text" id="buddy-code" placeholder="XXXX-XXXX" required>
+      <div class="input-row">
+        <input type="text" id="buddy-code" placeholder="XXXX-XXXX" required>
+        <button type="button" class="btn btn-small" id="btn-generate-code">Generate</button>
+      </div>
+      <p class="dim" id="pair-hint">Enter the code your buddy sent you, or generate one and send it to them. Both of you must use the same code.</p>
       <div class="dialog-actions">
         <button type="button" class="btn" id="btn-cancel-pair">Cancel</button>
         <button type="submit" class="btn btn-primary" id="btn-submit-pair">Pair</button>

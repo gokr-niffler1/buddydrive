@@ -60,6 +60,16 @@ proc initCrypto*(): bool =
 proc generateKey*(): string =
   crypto_secretbox_keygen()
 
+const PairingCodeAlphabet* = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+
+proc generatePairingCode*(): string =
+  ## Eight characters from libsodium's CSPRNG, formatted XXXX-XXXX. The code
+  ## is the only secret behind the discovery record and the relay rendezvous.
+  for i in 0 .. 7:
+    if i == 4:
+      result.add('-')
+    result.add(PairingCodeAlphabet[int(randombytes_uniform(uint32(PairingCodeAlphabet.len)))])
+
 proc generateNonce*(): string =
   randombytes(crypto_secretbox_noncebytes())
 

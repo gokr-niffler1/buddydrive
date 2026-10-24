@@ -2,6 +2,8 @@ import std/unittest
 import std/os except FileInfo
 import std/times
 import std/sequtils
+import std/algorithm
+import std/options
 import ../../../src/buddydrive/types
 import ../../../src/buddydrive/sync/scanner
 import ../../../src/buddydrive/sync/transfer
@@ -322,3 +324,67 @@ when defined(posix):
         let changes = scanner.scanChanges(prevFiles)
         check changes.len == 1
         check changes[0].kind == fcModified
+
+suite "safeJoin":
+  test "accepts a plain relative path":
+    withTestDir("safejoin_ok"):
+      check safeJoin(testDir, "a/b.txt") == some(testDir / "a/b.txt")
+
+  test "rejects paths that leave the root":
+    withTestDir("safejoin_escape"):
+      check safeJoin(testDir, "../outside.txt").isNone
+      check safeJoin(testDir, "a/../../outside.txt").isNone
+      check safeJoin(testDir, "/etc/passwd").isNone
+      check safeJoin(testDir, "").isNone
+      check safeJoin(testDir, "a//b").isNone
+      check safeJoin(testDir, "./a").isNone
+
+  when defined(posix):
+    test "rejects paths through a symlinked directory":
+      withTestDir("safejoin_symlink"):
+        createDir(testDir / "real")
+        createSymlink(testDir / "real", testDir / "link")
+        check safeJoin(testDir, "link/file.txt").isNone
+        check safeJoin(testDir, "real/file.txt").isSome
+
+suite "scanDirectoryStrict":
+  test "a missing folder raises instead of looking empty":
+    withTestDir("strict_missing"):
+      let scanner = newFileScanner(newFolderConfig("t", testDir / "gone"))
+      check scanner.scanDirectory().len == 0
+      expect ScannerError:
+        discard scanner.scanDirectoryStrict()
+
+  test "a readable folder scans like scanDirectory":
+    withTestDir("strict_ok"):
+      writeFile(testDir / "a.txt", "a")
+      createDir(testDir / "sub")
+      writeFile(testDir / "sub" / "b.txt", "b")
+      let scanner = newFileScanner(newFolderConfig("t", testDir))
+      check scanner.scanDirectoryStrict().mapIt(it.path).sorted() == @["a.txt", "sub/b.txt"]
+
+  when defined(posix):
+    test "an unreadable file raises instead of being listed with its plain name":
+      withTestDir("strict_locked_file"):
+        let key = generateKey()
+        var folder = newFolderConfig("t", testDir)
+        folder.folderKey = key
+        writeFile(testDir / "locked.txt", "secret")
+        setFilePermissions(testDir / "locked.txt", {})
+        defer: setFilePermissions(testDir / "locked.txt", {fpUserRead, fpUserWrite})
+        let scanner = newFileScanner(folder)
+        # The lenient scan lists it under its plaintext name even though the
+        # folder is encrypted.
+        let lenient = scanner.scanDirectory()
+        check lenient.len == 1 and lenient[0].encryptedPath == "locked.txt"
+        expect ScannerError:
+          discard scanner.scanDirectoryStrict()
+
+    test "an unreadable subfolder raises":
+      withTestDir("strict_locked_dir"):
+        createDir(testDir / "sub")
+        writeFile(testDir / "sub" / "b.txt", "b")
+        setFilePermissions(testDir / "sub", {})
+        defer: setFilePermissions(testDir / "sub", {fpUserRead, fpUserWrite, fpUserExec})
+        expect ScannerError:
+          discard newFileScanner(newFolderConfig("t", testDir)).scanDirectoryStrict()

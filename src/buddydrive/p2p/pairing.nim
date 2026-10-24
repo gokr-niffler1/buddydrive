@@ -30,7 +30,7 @@ type
     lastActivity*: Time
 
 const
-  PairingProtocol* = "/buddydrive/pairing/1.0.0"
+  PairingProtocol* = "/buddydrive/pairing/2.0.0"
   HandshakeTimeout* = chronos.seconds(30)
 
 proc newBuddyConnection*(): BuddyConnection =

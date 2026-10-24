@@ -49,6 +49,9 @@ task testConfig, "Run config tests":
 task testPolicy, "Run sync policy tests":
   exec "testament pattern \"tests/unit/policy/*.nim\""
 
+task testAddrs, "Run address selection tests":
+  exec "testament pattern \"tests/unit/addrs/*.nim\""
+
 task testScanner, "Run scanner tests":
   exec "testament pattern \"tests/unit/scanner/*.nim\""
 

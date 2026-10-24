@@ -214,7 +214,7 @@ proc localConfigJson(): JsonNode =
       "name": buddy.id.name,
       "pairing_code": buddy.pairingCode,
       "sync_time": buddy.syncTime,
-      "addedAt": buddy.addedAt.format("yyyy-MM-dd'T'HH:mm:ss'Z'")
+      "addedAt": buddy.addedAt.utc.format("yyyy-MM-dd'T'HH:mm:ss'Z'")
     })
   %*{
     "buddy": {
@@ -323,15 +323,6 @@ proc removeBuddyLocal(id: string): bool =
   var cfg = currentConfig()
   result = cfg.removeBuddy(id)
   discard refreshUI(nil)
-
-proc generatePairingInfo(): JsonNode =
-  let cfg = currentConfig()
-  %*{
-    "buddyId": cfg.buddy.uuid,
-    "buddyName": cfg.buddy.name,
-    "pairingCode": generatePairingCode(),
-    "expiresAt": (getTime() + initDuration(minutes = 5)).format("yyyy-MM-dd'T'HH:mm:ss'Z'")
-  }
 
 proc showAddFolderDialog(originalName, currentName, currentPath: string, encrypted, appendOnly: bool, buddies: seq[string])
 proc showPairBuddyDialog(originalId, buddyId, buddyName, code, syncTime: string)
@@ -508,6 +499,16 @@ proc createBuddyRow(buddy: JsonNode): GtkBox =
     let detailsLabel = gtkLabelNew(cstring(detailsText))
     gtkWidgetAddCssClass(detailsLabel, "caption")
     gtkBoxAppend(leftBox, detailsLabel)
+
+  if buddyId.len > 0 and buddyconfig.configExists():
+    try:
+      let storageText = "Storage: " & buddyconfig.loadConfig().buddyStorageRoot(buddyId)
+      let storageLabel = gtkLabelNew(cstring(storageText))
+      gtkWidgetAddCssClass(storageLabel, "caption")
+      gtkWidgetAddCssClass(storageLabel, "dim-label")
+      gtkBoxAppend(leftBox, storageLabel)
+    except CatchableError:
+      discard
   
   gtkBoxAppend(row, leftBox)
 
@@ -649,7 +650,7 @@ proc onAddFolderResponse(w: GtkWindow, responseId: cint, userData: pointer) {.cd
     if name.len > 0 and path.len > 0:
       if data.originalName.len == 0:
         var cfg = currentConfig()
-        var folder = newFolderConfig(name, path, encrypted)
+        var folder = newSyncFolder(name, path, encrypted)
         folder.appendOnly = appendOnly
         folder.buddies = buddyIds
         cfg.addFolder(folder)
@@ -803,6 +804,9 @@ proc showAddFolderDialog(originalName, currentName, currentPath: string, encrypt
 proc showPairBuddyDialog() =
   showPairBuddyDialog("", "", "", "", "")
 
+proc onGenerateCodeClick(btn: GtkButton, userData: pointer) {.cdecl.} =
+  gtkEditableSetText(userData, generatePairingCode().cstring)
+
 proc showPairBuddyDialog(originalId, buddyId, buddyName, code, syncTime: string) =
   let dialog = gtkDialogNew()
   gtkWindowSetTitle(dialog, cstring(if originalId.len == 0: "Pair with Buddy" else: "Edit Buddy"))
@@ -846,12 +850,26 @@ proc showPairBuddyDialog(originalId, buddyId, buddyName, code, syncTime: string)
   let codeLabel = gtkLabelNew("Pairing code:")
   gtkBoxAppend(content, codeLabel)
   
+  let codeRow = gtkBoxNew(GTKORIENTATIONHORIZONTAL, 6)
   let codeEntry = gtkEntryNew()
   gtkEntrySetPlaceholderText(codeEntry, "ABCD-EFGH")
   if code.len > 0:
     gtkEditableSetText(codeEntry, code.cstring)
-  gtkWidgetSetMarginBottom(codeEntry, 8)
-  gtkBoxAppend(content, codeEntry)
+  gtkWidgetSetHexpand(codeEntry, 1)
+  gtkBoxAppend(codeRow, codeEntry)
+  let generateBtn = gtkButtonNewWithLabel("Generate")
+  gtkBoxAppend(codeRow, generateBtn)
+  discard gSignalConnect(cast[GObject](generateBtn), "clicked", cast[GCallback](onGenerateCodeClick), codeEntry)
+  gtkBoxAppend(content, codeRow)
+
+  let codeHint = gtkLabelNew(cstring(
+    "Enter the code your buddy sent you, or generate one and send it to them " &
+    "together with your Buddy ID: " & currentConfig().buddy.uuid & ". Both of you must use the same code."))
+  gtkLabelSetWrap(codeHint, 1)
+  gtkWidgetAddCssClass(codeHint, "caption")
+  gtkWidgetAddCssClass(codeHint, "dim-label")
+  gtkWidgetSetMarginBottom(codeHint, 8)
+  gtkBoxAppend(content, codeHint)
 
   let syncTimeLabel = gtkLabelNew("Sync time (optional, HH:MM):")
   gtkBoxAppend(content, syncTimeLabel)
@@ -1197,17 +1215,17 @@ proc showExportRecoveryDialog() =
       "\n\nThe original 12-word phrase is not stored and cannot be shown again."
   )
 
-proc showGeneratedPairingCodeDialog() =
+proc showMyBuddyIdDialog() =
   if not buddyconfig.configExists():
     showMessageDialog("Pairing", "Initialize BuddyDrive first.")
     return
-  let info = if state.controlAvailable: apiGet("/buddies/pairing-code") else: generatePairingInfo()
+  let cfg = currentConfig()
   showMessageDialog(
-    "Share This Pairing Info",
-    "Your Buddy ID: " & info{"buddyId"}.getStr("") &
-      "\nYour Name: " & info{"buddyName"}.getStr("") &
-      "\nPairing Code: " & info{"pairingCode"}.getStr("") &
-      "\nExpires: " & info{"expiresAt"}.getStr("")
+    "Your Buddy ID",
+    "Your Buddy ID: " & cfg.buddy.uuid &
+      "\nYour Name: " & cfg.buddy.name &
+      "\n\nTo pair, both of you open Pair with Buddy and enter each other's Buddy ID. " &
+      "One of you presses Generate and sends the code; the other enters that same code."
   )
 
 proc syncConfigNow() =
@@ -1330,7 +1348,7 @@ proc createMainWindow(app: GtkApplication): GtkWindow =
   gtkWidgetSetMarginTop(pairBtn, 8)
   gtkBoxAppend(buddiesCard.content, pairBtn)
 
-  let pairingInfoBtn = gtkButtonNewWithLabel("Show My Pairing Code...")
+  let pairingInfoBtn = gtkButtonNewWithLabel("Show My Buddy ID...")
   gtkBoxAppend(buddiesCard.content, pairingInfoBtn)
   
   gtkBoxAppend(mainBox, buddiesCard.box)
@@ -1414,7 +1432,7 @@ proc createMainWindow(app: GtkApplication): GtkWindow =
   discard gSignalConnect(cast[GObject](pairBtn), "clicked", cast[GCallback](onPairClick), nil)
 
   proc onPairingInfoClick(btn: GtkButton, userData: pointer) {.cdecl.} =
-    showGeneratedPairingCodeDialog()
+    showMyBuddyIdDialog()
 
   discard gSignalConnect(cast[GObject](pairingInfoBtn), "clicked", cast[GCallback](onPairingInfoClick), nil)
   

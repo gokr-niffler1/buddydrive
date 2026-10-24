@@ -50,19 +50,19 @@ This creates:
 
 ### Pair With a Buddy
 
-**On your machine:**
+Exchange Buddy IDs first. Then, **on your machine:**
 
 ```bash
-buddydrive add-buddy --generate-code
+buddydrive add-buddy --generate-code --id <your-buddys-id>
 ```
 
-**On your buddy's machine:**
+This saves your buddy with a new pairing code and prints the command to send them. **On your buddy's machine:**
 
 ```bash
-buddydrive add-buddy --id <your-buddy-id> --code ABCD-EFGH
+buddydrive add-buddy --id <your-id> --code ABCD-EFGH
 ```
 
-The pairing code is used for both pairing confirmation and relay fallback.
+Both sides must store the same code: it keys discovery and relay fallback for the two of you.
 
 ### Add a Folder
 
@@ -152,7 +152,7 @@ buddydrive status
 ### Current CLI Limitations
 
 - `buddydrive start --daemon` is not fully implemented yet
-- `buddydrive stop` is a placeholder command today
+- `buddydrive stop`, `Ctrl+C` or SIGTERM shut the daemon down cleanly
 - `buddydrive status` shows configured state, not live daemon connectivity
 - `buddydrive connect` does not perform a manual direct dial yet
 - `buddydrive export-recovery` shows stored recovery metadata, not the original 12-word phrase
@@ -198,16 +198,16 @@ buddydrive add-folder <path>           Add folder to sync
 buddydrive remove-folder <name>        Remove folder
 buddydrive list-folders                List configured folders
 buddydrive add-buddy                   Pair with a buddy
-  --generate-code                      Generate pairing code
   --id <buddy-id>                      Buddy ID to pair with
-  --code <code>                        Pairing code from buddy
+  --generate-code                      Generate a code, save it for this buddy
+  --code <code>                        Pairing code your buddy generated
 buddydrive remove-buddy <id>           Remove buddy
 buddydrive list-buddies                List paired buddies
 buddydrive connect <address>           Manual connect placeholder
 buddydrive start                       Start sync daemon
   --port <control-port>                Override control API port
   --daemon                             Accepted but stays foreground
-buddydrive stop                        Stop placeholder command
+buddydrive stop                        Ask the daemon to shut down cleanly
 buddydrive status                      Show configured status
 buddydrive logs                        Show recent logs
 buddydrive setup-recovery              Generate recovery phrase and sync encrypted config
@@ -220,9 +220,9 @@ buddydrive help                        Show help
 ### Examples
 
 ```bash
-# Pair with a buddy
-buddydrive add-buddy --generate-code
-buddydrive add-buddy --id abc123 --code XYZ-789
+# Pair with a buddy (you generate, they enter the same code)
+buddydrive add-buddy --generate-code --id <their-id>
+buddydrive add-buddy --id <your-id> --code ABCD-EFGH   # on their machine
 
 # Add folders
 buddydrive add-folder ~/Photos --name photos

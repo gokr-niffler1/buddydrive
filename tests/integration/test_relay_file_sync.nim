@@ -1,42 +1,27 @@
 import std/unittest
 import std/os
+import std/sequtils
 import chronos
 import ../../src/buddydrive/types
-import ../../src/buddydrive/crypto
 import ../../src/buddydrive/p2p/rawrelay
 import ../../src/buddydrive/p2p/pairing
 import ../../src/buddydrive/p2p/protocol
 import ../../src/buddydrive/sync/session
 import ../support/test_relay
 import ../testutils
+import ../support/sync_fixtures
 
 useIsolatedDataDir("relay_file_sync")
 
-proc makeConfig(
+proc relayConfig(
     selfId: string,
-    selfName: string,
     otherId: string,
-    otherName: string,
-    pairingCode: string,
-    folderPath: string,
-    appendOnly = false,
-    folderName = "docs",
-    encrypted = false,
-    folderKey = "",
+    storagePath: string,
+    folders: seq[FolderConfig],
 ): AppConfig =
-  result = newAppConfig(newBuddyId(selfId, selfName))
+  result = peerConfig(selfId, otherId, storagePath, folders, pairingCode = "swift-eagle")
   result.relayRegion = "local"
   result.apiBaseUrl = ""
-  var buddy: BuddyInfo
-  buddy.id = newBuddyId(otherId, otherName)
-  buddy.pairingCode = pairingCode
-  result.buddies = @[buddy]
-  var folder = newFolderConfig(folderName, folderPath)
-  folder.appendOnly = appendOnly
-  folder.encrypted = encrypted
-  folder.folderKey = folderKey
-  folder.buddies = @[otherId]
-  result.folders = @[folder]
 
 proc connectAndSync(config: AppConfig): Future[void] {.async.} =
   let cache = initRelayListCache()
@@ -63,6 +48,10 @@ proc freshDirs(base: string, names: varargs[string]): seq[string] =
     createDir(dir)
     result.add(dir)
 
+proc blobContents(root: string): seq[string] =
+  for path in storedFiles(root, ".blob"):
+    result.add(readFile(root / path))
+
 suite "Relay file sync":
   var relay: TestRelay
 
@@ -72,254 +61,97 @@ suite "Relay file sync":
   teardown:
     waitFor relay.stop()
 
-  test "forward sync (A -> B)":
-    let tempBase = getTempDir() / "buddydrive-relay-file-sync"
-    let dirs = freshDirs(tempBase, "peer-a", "peer-b")
-    let folderA = dirs[0]
-    let folderB = dirs[1]
-    defer:
-      removeDir(tempBase)
-
-    let content = "hello from A\n"
-    writeFile(folderA / "hello.txt", content)
-
-    let cfg1 = makeConfig(
-      "11111111-1111-1111-1111-111111111111", "buddy-one",
-      "22222222-2222-2222-2222-222222222222", "buddy-two",
-      "swift-eagle", folderA
-    )
-    let cfg2 = makeConfig(
-      "22222222-2222-2222-2222-222222222222", "buddy-two",
-      "11111111-1111-1111-1111-111111111111", "buddy-one",
-      "swift-eagle", folderB
-    )
-
-    syncPeers(cfg1, cfg2)
-
-    check fileExists(folderB / "hello.txt")
-    check readFile(folderB / "hello.txt") == content
-    check fileExists(folderA / "hello.txt")
-    check readFile(folderA / "hello.txt") == content
-
-  test "reverse sync (B -> A)":
-    let tempBase = getTempDir() / "buddydrive-relay-file-sync-rev"
-    let dirs = freshDirs(tempBase, "peer-a", "peer-b")
-    let folderA = dirs[0]
-    let folderB = dirs[1]
-    defer:
-      removeDir(tempBase)
-
-    let content = "data from B\n"
-    writeFile(folderB / "from-b.txt", content)
-
-    let cfg1 = makeConfig(
-      "11111111-1111-1111-1111-111111111111", "buddy-one",
-      "22222222-2222-2222-2222-222222222222", "buddy-two",
-      "swift-eagle", folderA
-    )
-    let cfg2 = makeConfig(
-      "22222222-2222-2222-2222-222222222222", "buddy-two",
-      "11111111-1111-1111-1111-111111111111", "buddy-one",
-      "swift-eagle", folderB
-    )
-
-    syncPeers(cfg1, cfg2)
-
-    check fileExists(folderA / "from-b.txt")
-    check readFile(folderA / "from-b.txt") == content
-    check fileExists(folderB / "from-b.txt")
-
-  test "both directions in one session":
+  test "both buddies back up their folders to each other in one session":
     let tempBase = getTempDir() / "buddydrive-relay-file-sync-both"
-    let dirs = freshDirs(tempBase, "peer-a", "peer-b")
-    let folderA = dirs[0]
-    let folderB = dirs[1]
+    let dirs = freshDirs(tempBase, "docs-a", "docs-b")
     defer:
       removeDir(tempBase)
 
-    writeFile(folderA / "from-a.txt", "a\n")
-    writeFile(folderB / "from-b.txt", "b\n")
+    writeFile(dirs[0] / "from-a.txt", "a secret\n")
+    writeFile(dirs[1] / "from-b.txt", "b secret\n")
 
-    let cfg1 = makeConfig(
-      "11111111-1111-1111-1111-111111111111", "buddy-one",
-      "22222222-2222-2222-2222-222222222222", "buddy-two",
-      "swift-eagle", folderA
-    )
-    let cfg2 = makeConfig(
-      "22222222-2222-2222-2222-222222222222", "buddy-two",
-      "11111111-1111-1111-1111-111111111111", "buddy-one",
-      "swift-eagle", folderB
-    )
+    let cfgA = relayConfig(BuddyOne, BuddyTwo, tempBase / "a-stores", @[syncFolder("folder-a", dirs[0])])
+    let cfgB = relayConfig(BuddyTwo, BuddyOne, tempBase / "b-stores", @[syncFolder("folder-b", dirs[1])])
 
-    syncPeers(cfg1, cfg2)
+    syncPeers(cfgA, cfgB)
 
-    check fileExists(folderA / "from-b.txt")
-    check fileExists(folderB / "from-a.txt")
-    check readFile(folderA / "from-a.txt") == "a\n"
-    check readFile(folderB / "from-b.txt") == "b\n"
+    check toSeq(walkDirRec(dirs[0], relative = true)) == @["from-a.txt"]
+    check toSeq(walkDirRec(dirs[1], relative = true)) == @["from-b.txt"]
+    check storedFiles(tempBase / "b-stores" / "folder-a", ".blob").len == 1
+    check storedFiles(tempBase / "a-stores" / "folder-b", ".blob").len == 1
+    check not anyFileMentions(tempBase / "b-stores", ["from-a", "a secret"])
+    check not anyFileMentions(tempBase / "a-stores", ["from-b", "b secret"])
 
-  test "local deletion propagates to buddy":
-    let tempBase = getTempDir() / "buddydrive-relay-file-sync-delete"
-    let dirs = freshDirs(tempBase, "peer-a", "peer-b")
-    let folderA = dirs[0]
-    let folderB = dirs[1]
+  test "large file survives the relay and comes back intact":
+    let tempBase = getTempDir() / "buddydrive-relay-file-sync-large"
+    let dirs = freshDirs(tempBase, "docs-a", "docs-b", "restored")
     defer:
       removeDir(tempBase)
 
-    writeFile(folderA / "doomed.txt", "delete me\n")
+    var content = newString(300 * 1024)
+    for i in 0 ..< content.len:
+      content[i] = char((i * 7919) mod 251)
+    writeFile(dirs[0] / "big.bin", content)
 
-    let cfg1 = makeConfig(
-      "11111111-1111-1111-1111-111111111111", "buddy-one",
-      "22222222-2222-2222-2222-222222222222", "buddy-two",
-      "swift-eagle", folderA
-    )
-    let cfg2 = makeConfig(
-      "22222222-2222-2222-2222-222222222222", "buddy-two",
-      "11111111-1111-1111-1111-111111111111", "buddy-one",
-      "swift-eagle", folderB
-    )
+    let source = syncFolder("folder-a", dirs[0])
+    let cfgB = relayConfig(BuddyTwo, BuddyOne, tempBase / "b-stores", @[syncFolder("folder-b", dirs[1])])
+    syncPeers(relayConfig(BuddyOne, BuddyTwo, tempBase / "a-stores", @[source]), cfgB)
 
-    syncPeers(cfg1, cfg2)
-    check fileExists(folderB / "doomed.txt")
+    var replacement = source
+    replacement.path = dirs[2]
+    syncPeers(relayConfig(BuddyOne, BuddyTwo, tempBase / "a-stores", @[replacement]), cfgB)
 
-    removeFile(folderA / "doomed.txt")
-    syncPeers(cfg1, cfg2)
+    check readFile(dirs[2] / "big.bin") == content
 
-    check not fileExists(folderA / "doomed.txt")
-    check not fileExists(folderB / "doomed.txt")
-
-  test "append-only folder preserves existing files":
-    let tempBase = getTempDir() / "buddydrive-relay-file-sync-append"
-    let dirs = freshDirs(tempBase, "append-a", "append-b")
-    let folderA = dirs[0]
-    let folderB = dirs[1]
+  test "rename, edit and deletion reach the buddy's storage":
+    let tempBase = getTempDir() / "buddydrive-relay-file-sync-changes"
+    let dirs = freshDirs(tempBase, "docs-a", "docs-b", "restored")
     defer:
       removeDir(tempBase)
 
-    writeFile(folderA / "shared.txt", "version from A\n")
-    writeFile(folderB / "shared.txt", "version from B\n")
+    writeFile(dirs[0] / "old-name.txt", "same content\n")
+    writeFile(dirs[0] / "edit.txt", "first\n")
+    writeFile(dirs[0] / "doomed.txt", "delete me\n")
 
-    let cfg1 = makeConfig(
-      "11111111-1111-1111-1111-111111111111", "buddy-one",
-      "22222222-2222-2222-2222-222222222222", "buddy-two",
-      "swift-eagle", folderA, appendOnly = false
-    )
-    let cfg2 = makeConfig(
-      "22222222-2222-2222-2222-222222222222", "buddy-two",
-      "11111111-1111-1111-1111-111111111111", "buddy-one",
-      "swift-eagle", folderB, appendOnly = true
-    )
+    let source = syncFolder("folder-a", dirs[0])
+    let cfgA = relayConfig(BuddyOne, BuddyTwo, tempBase / "a-stores", @[source])
+    let cfgB = relayConfig(BuddyTwo, BuddyOne, tempBase / "b-stores", @[syncFolder("folder-b", dirs[1])])
+    let storedAtB = tempBase / "b-stores" / "folder-a"
 
-    syncPeers(cfg1, cfg2)
+    syncPeers(cfgA, cfgB)
+    check storedFiles(storedAtB, ".blob").len == 3
 
-    check readFile(folderB / "shared.txt") == "version from B\n"
+    moveFile(dirs[0] / "old-name.txt", dirs[0] / "new-name.txt")
+    writeFile(dirs[0] / "edit.txt", "second\n")
+    removeFile(dirs[0] / "doomed.txt")
+    syncPeers(cfgA, cfgB)
+    check storedFiles(storedAtB, ".blob").len == 2
 
-  test "append-only folder ignores a remote deletion":
-    let tempBase = getTempDir() / "buddydrive-relay-file-sync-append-del"
-    let dirs = freshDirs(tempBase, "append-a", "append-b")
-    let folderA = dirs[0]
-    let folderB = dirs[1]
-    defer:
-      removeDir(tempBase)
+    var replacement = source
+    replacement.path = dirs[2]
+    syncPeers(relayConfig(BuddyOne, BuddyTwo, tempBase / "a-stores", @[replacement]), cfgB)
+    check readFile(dirs[2] / "new-name.txt") == "same content\n"
+    check readFile(dirs[2] / "edit.txt") == "second\n"
+    check not fileExists(dirs[2] / "old-name.txt")
+    check not fileExists(dirs[2] / "doomed.txt")
 
-    writeFile(folderA / "keeper.txt", "keep me\n")
-
-    let cfg1 = makeConfig(
-      "11111111-1111-1111-1111-111111111111", "buddy-one",
-      "22222222-2222-2222-2222-222222222222", "buddy-two",
-      "swift-eagle", folderA
-    )
-    let cfg2 = makeConfig(
-      "22222222-2222-2222-2222-222222222222", "buddy-two",
-      "11111111-1111-1111-1111-111111111111", "buddy-one",
-      "swift-eagle", folderB, appendOnly = true
-    )
-
-    syncPeers(cfg1, cfg2)
-    check fileExists(folderB / "keeper.txt")
-
-    removeFile(folderA / "keeper.txt")
-    syncPeers(cfg1, cfg2)
-
-    check fileExists(folderB / "keeper.txt")
-    check readFile(folderB / "keeper.txt") == "keep me\n"
-
-    # A has forgotten the path by now, so the archive copy comes back to A on
-    # the next session. Restoring from the append-only side is the point of it.
-    syncPeers(cfg1, cfg2)
-    check fileExists(folderA / "keeper.txt")
-    check readFile(folderA / "keeper.txt") == "keep me\n"
-    check fileExists(folderB / "keeper.txt")
-
-  test "move detection renames remote file":
-    let tempBase = getTempDir() / "buddydrive-relay-file-sync-move"
-    let dirs = freshDirs(tempBase, "move-a", "move-b")
-    let folderA = dirs[0]
-    let folderB = dirs[1]
-    defer:
-      removeDir(tempBase)
-
-    writeFile(folderA / "new-name.txt", "same content\n")
-    writeFile(folderB / "old-name.txt", "same content\n")
-
-    let cfg1 = makeConfig(
-      "11111111-1111-1111-1111-111111111111", "buddy-one",
-      "22222222-2222-2222-2222-222222222222", "buddy-two",
-      "swift-eagle", folderA
-    )
-    let cfg2 = makeConfig(
-      "22222222-2222-2222-2222-222222222222", "buddy-two",
-      "11111111-1111-1111-1111-111111111111", "buddy-one",
-      "swift-eagle", folderB
-    )
-
-    syncPeers(cfg1, cfg2)
-
-    check not fileExists(folderB / "old-name.txt")
-    check fileExists(folderB / "new-name.txt")
-    check readFile(folderB / "new-name.txt") == "same content\n"
-
-  test "mixed encrypted and unencrypted folders sync":
+  test "encrypted and unencrypted folders side by side":
     let tempBase = getTempDir() / "buddydrive-relay-file-sync-mixed"
-    let dirs = freshDirs(tempBase, "enc-a", "enc-b", "plain-a", "plain-b")
-    let encA = dirs[0]
-    let encB = dirs[1]
-    let plainA = dirs[2]
-    let plainB = dirs[3]
+    let dirs = freshDirs(tempBase, "enc-a", "plain-a", "docs-b")
     defer:
       removeDir(tempBase)
 
-    let sharedFolderKey = generateKey()
-    writeFile(encA / "secret.txt", "top secret\n")
-    writeFile(plainA / "shared.txt", "shared data\n")
+    writeFile(dirs[0] / "secret.txt", "top secret\n")
+    writeFile(dirs[1] / "shared.txt", "shared data\n")
 
-    var cfg1 = makeConfig(
-      "11111111-1111-1111-1111-111111111111", "buddy-one",
-      "22222222-2222-2222-2222-222222222222", "buddy-two",
-      "swift-eagle", encA,
-      folderName = "encrypted-docs",
-      encrypted = true,
-      folderKey = sharedFolderKey,
-    )
-    var plainFolder1 = newFolderConfig("shared-docs", plainA)
-    plainFolder1.buddies = @["22222222-2222-2222-2222-222222222222"]
-    cfg1.folders.add(plainFolder1)
+    let cfgA = relayConfig(BuddyOne, BuddyTwo, tempBase / "a-stores", @[
+      syncFolder("folder-enc", dirs[0], name = "encrypted-docs"),
+      syncFolder("folder-plain", dirs[1], name = "shared-docs", encrypted = false),
+    ])
+    let cfgB = relayConfig(BuddyTwo, BuddyOne, tempBase / "b-stores", @[syncFolder("folder-b", dirs[2])])
 
-    var cfg2 = makeConfig(
-      "22222222-2222-2222-2222-222222222222", "buddy-two",
-      "11111111-1111-1111-1111-111111111111", "buddy-one",
-      "swift-eagle", encB,
-      folderName = "encrypted-docs",
-      encrypted = true,
-      folderKey = sharedFolderKey,
-    )
-    var plainFolder2 = newFolderConfig("shared-docs", plainB)
-    plainFolder2.buddies = @["11111111-1111-1111-1111-111111111111"]
-    cfg2.folders.add(plainFolder2)
+    syncPeers(cfgA, cfgB)
 
-    syncPeers(cfg1, cfg2)
-
-    check fileExists(encB / "secret.txt")
-    check readFile(encB / "secret.txt") == "top secret\n"
-    check fileExists(plainB / "shared.txt")
-    check readFile(plainB / "shared.txt") == "shared data\n"
+    check storedFiles(tempBase / "b-stores" / "folder-enc", ".blob").len == 1
+    check not anyFileMentions(tempBase / "b-stores" / "folder-enc", ["secret"])
+    check readFile(tempBase / "b-stores" / "folder-plain" / "shared.txt") == "shared data\n"

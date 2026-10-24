@@ -13,9 +13,14 @@ type
 
   SyncProtocol* = ref object
 
-const
-  ReadTimeout* = chronos.seconds(30)
-  WriteTimeout* = chronos.seconds(30)
+var
+  messageIdleTimeout* = chronos.minutes(5)
+    ## How long a buddy may stay silent mid-session before we give up on it.
+    ## The session runs inside the connection handler, so without a limit a
+    ## buddy that stalls would hold the connection forever.
+  folderListTimeout* = chronos.minutes(30)
+    ## Waiting for the buddy's folder lists covers its scan of every folder;
+    ## hashing a large folder for the first time takes a while.
 
 proc newSyncProtocol*(): SyncProtocol =
   result = SyncProtocol()
@@ -24,7 +29,8 @@ proc newSyncProtocol*[T](node: T): SyncProtocol =
   discard node
   result = SyncProtocol()
 
-proc sendFramedMessage*(conn: Connection, msg: ProtocolMessage): Future[void] {.async.} =
+proc sendFramedMessage*(conn: Connection, msg: ProtocolMessage, timeout = messageIdleTimeout): Future[void] {.async.} =
+  ## Raises AsyncTimeoutError when the buddy stops reading.
   let encoded = encode(msg)
   var lenBytes: array[4, byte]
   lenBytes[0] = byte(encoded.len shr 24)
@@ -32,13 +38,15 @@ proc sendFramedMessage*(conn: Connection, msg: ProtocolMessage): Future[void] {.
   lenBytes[2] = byte(encoded.len shr 8)
   lenBytes[3] = byte(encoded.len)
 
-  await conn.write(@lenBytes)
-  await conn.write(encoded)
+  await conn.write(@lenBytes).wait(timeout)
+  await conn.write(encoded).wait(timeout)
 
-proc receiveFramedMessage*(conn: Connection): Future[Option[ProtocolMessage]] {.async.} =
+proc receiveFramedMessage*(conn: Connection, timeout = messageIdleTimeout): Future[Option[ProtocolMessage]] {.async.} =
+  ## none when the stream ends, the message is unusable, or nothing arrives
+  ## within the timeout; the stream is not usable after any of those.
   try:
     var lenBytes: array[4, byte]
-    await conn.readExactly(addr lenBytes[0], 4)
+    await conn.readExactly(addr lenBytes[0], 4).wait(timeout)
 
     let msgLen = int(lenBytes[0]) shl 24 or
                  int(lenBytes[1]) shl 16 or
@@ -49,7 +57,7 @@ proc receiveFramedMessage*(conn: Connection): Future[Option[ProtocolMessage]] {.
       return none(ProtocolMessage)
 
     var data = newSeq[byte](msgLen)
-    await conn.readExactly(addr data[0], msgLen)
+    await conn.readExactly(addr data[0], msgLen).wait(timeout)
 
     let decoded = decode(data)
     if decoded.isErr:
@@ -59,13 +67,13 @@ proc receiveFramedMessage*(conn: Connection): Future[Option[ProtocolMessage]] {.
   except:
     return none(ProtocolMessage)
 
-proc sendMessage*(protocol: SyncProtocol, conn: Connection, msg: ProtocolMessage): Future[void] {.async.} =
+proc sendMessage*(protocol: SyncProtocol, conn: Connection, msg: ProtocolMessage, timeout = messageIdleTimeout): Future[void] {.async.} =
   discard protocol
-  await sendFramedMessage(conn, msg)
+  await sendFramedMessage(conn, msg, timeout)
 
-proc receiveMessage*(protocol: SyncProtocol, conn: Connection): Future[Option[ProtocolMessage]] {.async.} =
+proc receiveMessage*(protocol: SyncProtocol, conn: Connection, timeout = messageIdleTimeout): Future[Option[ProtocolMessage]] {.async.} =
   discard protocol
-  return await receiveFramedMessage(conn)
+  return await receiveFramedMessage(conn, timeout)
 
 proc sendPing*(protocol: SyncProtocol, conn: Connection): Future[int64] {.async.} =
   let ping = newPing()

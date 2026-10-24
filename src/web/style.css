@@ -263,6 +263,7 @@ main {
 
 /* Dialogs */
 dialog {
+  margin: auto;
   border: none;
   border-radius: var(--radius);
   box-shadow: 0 8px 32px rgba(0,0,0,0.15);
@@ -362,4 +363,28 @@ dialog legend {
   #buddy-name, #uptime {
     display: none;
   }
+}
+
+.input-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.input-row input {
+  flex: 1;
+  min-width: 0;
+}
+
+#folder-buddies-fieldset {
+  margin-top: 16px;
+}
+
+#folder-buddies .checkbox-label {
+  margin-top: 6px !important;
+}
+
+#folder-error {
+  color: var(--danger);
+  margin-top: 12px;
 }

@@ -9,6 +9,7 @@ import libp2p/stream/connection
 from libp2p/protocols/protocol import LPProtocol
 import types
 import p2p/node
+import p2p/addrs
 import p2p/discovery
 import p2p/protocol
 import p2p/pairing
@@ -16,6 +17,7 @@ import p2p/rawrelay
 import sync/policy
 import sync/session
 import config
+import logutils
 import sync/scanner
 import control
 import nat
@@ -71,51 +73,6 @@ proc newDaemon*(config: AppConfig): Daemon =
 
   if config.recovery.enabled and config.recovery.masterKey.len > 0:
     result.masterKey = some(hexToBytes(config.recovery.masterKey))
-
-proc isPrivateOrLoopback(ma: MultiAddress): bool =
-  let s = $ma
-  if s.contains("/p2p-circuit"):
-    return true
-  if s.startsWith("/ip4/127.") or s.startsWith("/ip4/10.") or
-      s.startsWith("/ip4/192.168.") or s.startsWith("/ip4/169.254."):
-    return true
-  if s.startsWith("/ip4/172."):
-    let parts = s.split("/")
-    if parts.len > 2:
-      let octets = parts[2].split(".")
-      if octets.len > 1:
-        try:
-          let second = parseInt(octets[1])
-          return second >= 16 and second <= 31
-        except ValueError:
-          discard
-  if s.startsWith("/ip4/100."):
-    let parts = s.split("/")
-    if parts.len > 2:
-      let octets = parts[2].split(".")
-      if octets.len > 1:
-        try:
-          let second = parseInt(octets[1])
-          return second >= 64 and second <= 127
-        except ValueError:
-          discard
-  if s.startsWith("/ip6/::1") or s.startsWith("/ip6/fc") or
-      s.startsWith("/ip6/fd") or s.startsWith("/ip6/fe80"):
-    return true
-  false
-
-proc isRelayAddress(ma: MultiAddress): bool =
-  ($ma).contains("/p2p-circuit")
-
-proc directDialableAddrs(addrs: seq[MultiAddress]): seq[MultiAddress] =
-  for ma in addrs:
-    let s = $ma
-    if isRelayAddress(ma):
-      continue
-    if isPrivateOrLoopback(ma):
-      continue
-    if s.contains("/tcp/"):
-      result.add(ma)
 
 proc hasDirectReachability(addrs: seq[MultiAddress]): bool =
   directDialableAddrs(addrs).len > 0
@@ -238,12 +195,41 @@ proc handleIncomingConnection*(daemon: Daemon, conn: Connection) {.async.} =
       if existing != nil:
         await existing.close()
     daemon.buddyConnections[bc.buddyId] = bc
-    asyncSpawn daemon.runBuddySync(bc)
+    # libp2p closes an incoming stream as soon as its handler returns, so the
+    # session has to run to the end inside the handler.
+    await daemon.runBuddySync(bc)
   else:
     echo "Rejected connection from unknown buddy"
     await bc.close()
 
+proc mountPairingProtocol*(daemon: Daemon) {.async.} =
+  ## Accepts buddies dialing in on the started node.
+  let pairingHandler = proc(conn: Connection, proto: string): Future[void] {.closure, gcsafe, async: (raises: [CancelledError]).} =
+    try:
+      await daemon.handleIncomingConnection(conn)
+    except CancelledError:
+      raise
+    except CatchableError:
+      discard
+
+  let pairingProto = LPProtocol.new(@[PairingProtocol], pairingHandler)
+  await pairingProto.start()
+  daemon.node.switch.mount(pairingProto)
+
 proc connectToBuddies*(daemon: Daemon) {.async: (raises: []).}
+
+proc repairFolderIdentities(daemon: Daemon) =
+  ## Folders made without an id or key get them before anything is synced.
+  {.cast(gcsafe).}:
+    try:
+      let changes = daemon.config.ensureFolderIdentities()
+      if changes.len > 0:
+        saveConfig(daemon.config)
+        daemon.configMtime = getLastModificationTime(getConfigPath())
+        for change in changes:
+          logWarn("Config repaired: " & change)
+    except Exception as e:
+      echo "Could not repair folder config: ", e.msg
 
 proc reloadConfigIfChanged(daemon: Daemon) {.gcsafe.} =
   {.cast(gcsafe).}:
@@ -254,6 +240,7 @@ proc reloadConfigIfChanged(daemon: Daemon) {.gcsafe.} =
         daemon.config = loadConfig()
         daemon.configMtime = mtime
         echo "Config reloaded from disk"
+        daemon.repairFolderIdentities()
     except CatchableError as e:
       echo "Config reload failed: ", e.msg
 
@@ -276,12 +263,12 @@ proc start*(daemon: Daemon, controlPort: int = DefaultControlPort): Future[void]
     return
   
   echo "Starting daemon..."
+  daemon.repairFolderIdentities()
 
   for folder in daemon.config.folders:
     cleanupTempFiles(folder.path)
-    if daemon.config.storageBasePath.len > 0:
-      for buddyId in folder.buddies:
-        cleanupTempFiles(daemon.config.storageBasePath / buddyId / folder.name)
+  for buddy in daemon.config.buddies:
+    cleanupTempFiles(daemon.config.buddyStorageRoot(buddy.id.uuid))
 
   try:
     var announceAddrs: seq[MultiAddress] = @[]
@@ -312,17 +299,7 @@ proc start*(daemon: Daemon, controlPort: int = DefaultControlPort): Future[void]
     await daemon.node.start()
     daemon.syncProtocol = newSyncProtocol(daemon.node)
 
-    let pairingHandler = proc(conn: Connection, proto: string): Future[void] {.closure, gcsafe, async: (raises: [CancelledError]).} =
-      try:
-        await daemon.handleIncomingConnection(conn)
-      except CancelledError:
-        raise
-      except CatchableError:
-        discard
-
-    let pairingProto = LPProtocol.new(@[PairingProtocol], pairingHandler)
-    await pairingProto.start()
-    daemon.node.switch.mount(pairingProto)
+    await daemon.mountPairingProtocol()
 
     echo "Node started with Peer ID: ", daemon.node.peerIdStr()
     
@@ -331,7 +308,7 @@ proc start*(daemon: Daemon, controlPort: int = DefaultControlPort): Future[void]
 
     daemon.startupReachabilityDiagnostic()
     
-    daemon.discovery = newDiscovery(daemon.node, daemon.config.apiBaseUrl)
+    daemon.discovery = newDiscovery(daemon.node, daemon.config.apiBaseUrl, daemon.config.buddy.uuid)
     await daemon.discovery.start()
 
     if daemon.config.buddies.len > 0:
@@ -354,11 +331,10 @@ proc start*(daemon: Daemon, controlPort: int = DefaultControlPort): Future[void]
           running = true
         )
     
+    # Kept, not asyncSpawn-ed: stop() cancels them, and chronos turns the
+    # cancellation of a spawned task into a fatal FutureDefect.
     daemon.discoveryLoop = daemon.runDiscoveryLoop()
-    asyncSpawn daemon.discoveryLoop
-    
     daemon.statusUpdateFut = statusUpdateLoop(daemon)
-    asyncSpawn daemon.statusUpdateFut
     
     startControlServer(controlPort)
     
@@ -479,6 +455,14 @@ proc buddyPairingCode(config: AppConfig, buddyId: string): string =
     if buddy.id.uuid == buddyId:
       return buddy.pairingCode
 
+proc configuredBuddyAddrs(config: AppConfig, buddyId: string): seq[MultiAddress] =
+  ## Addresses set by hand in [[buddies]] addresses, dialed before anything
+  ## discovery found. Meant for buddies on the same network, whose private
+  ## addresses are never published.
+  for buddy in config.buddies:
+    if buddy.id.uuid == buddyId:
+      return parseAddrs(buddy.addresses)
+
 proc connectToBuddyViaRelay(daemon: Daemon, buddyId: string): Future[bool] {.async: (raises: []).} =
   let pairingCode = buddyPairingCode(daemon.config, buddyId)
   if daemon.config.relayRegion.len == 0 or pairingCode.len == 0:
@@ -525,7 +509,7 @@ proc explainDirectConnectivityFailure(addrs: seq[MultiAddress]): string =
 
   let privateOnly = addrs.allIt(isPrivateOrLoopback(it))
   if privateOnly:
-    return "buddy only advertised private or loopback addresses"
+    return "buddy only advertised private addresses, and none of them is on our local network"
 
   "no public TCP address was found among discovered addresses"
 
@@ -534,7 +518,10 @@ proc connectToBuddy*(daemon: Daemon, buddyId: string, peerId: PeerID, addrs: seq
     return false
 
   let directPhaseStartedAt = getTime()
-  let dialAddrs = directDialableAddrs(addrs)
+  var dialAddrs = configuredBuddyAddrs(daemon.config, buddyId)
+  for ma in lanDialableAddrs(addrs, daemon.node.getAddrs()) & directDialableAddrs(addrs):
+    if ma notin dialAddrs:
+      dialAddrs.add(ma)
   if dialAddrs.len == 0:
     let elapsedSeconds = int((getTime() - directPhaseStartedAt).inSeconds)
     if elapsedSeconds < RelayJoinDelaySeconds:
@@ -632,7 +619,7 @@ proc connectToBuddies*(daemon: Daemon) {.async: (raises: []).} =
       )
       continue
     try:
-      let record = daemon.discovery.findBuddy(buddy.pairingCode)
+      let record = daemon.discovery.findBuddy(buddy.pairingCode, buddy.id.uuid)
       if record.isSome:
         let rec = record.get()
         if not shouldInitiate(daemon.config.buddy.uuid, myPubliclyReachable, buddy.id.uuid, rec):
@@ -657,7 +644,7 @@ proc connectToBuddies*(daemon: Daemon) {.async: (raises: []).} =
             addrs.add(maRes.get())
 
         let pidRes = PeerID.init(rec.peerId)
-        if pidRes.isOk and addrs.len > 0:
+        if pidRes.isOk and (addrs.len > 0 or buddy.addresses.len > 0):
           discard await daemon.connectToBuddy(buddy.id.uuid, pidRes.get(), addrs)
         elif addrs.len == 0:
           if rec.relayRegion.len > 0:
@@ -697,7 +684,7 @@ proc connectToBuddies*(daemon: Daemon) {.async: (raises: []).} =
               addrs.add(maRes.get())
 
           let pidRes = PeerID.init(cached.get().peerId)
-          if pidRes.isOk and addrs.len > 0:
+          if pidRes.isOk and (addrs.len > 0 or buddy.addresses.len > 0):
             discard await daemon.connectToBuddy(buddy.id.uuid, pidRes.get(), addrs)
           elif cached.get().relayRegion.len > 0:
             daemon.logDiagnostic(

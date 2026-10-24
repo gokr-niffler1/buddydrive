@@ -175,6 +175,40 @@ suite "Base58 encoding":
     for c in encoded:
       check c in validChars
 
+  test "matches the standard Base58 test vectors":
+    # From Bitcoin Core's base58_encode_decode.json.
+    proc fromHex(hex: string): seq[byte] =
+      for i in countup(0, hex.len - 2, 2):
+        result.add(byte(parseHexInt(hex[i .. i + 1])))
+    let vectors = [
+      ("", ""),
+      ("61", "2g"),
+      ("626262", "a3gV"),
+      ("636363", "aPEr"),
+      ("73696d706c792061206c6f6e6720737472696e67", "2cFupjhnEsSn59qHXstmK2ffpLv2"),
+      ("00eb15231dfceb60925886b67d065299925915aeb172c06647", "1NS17iag9jJgTHD1VXjvLCEnZuQ3rJDE9L"),
+      ("516b6fcd0f", "ABnLTmg"),
+      ("bf4f89001e670274dd", "3SEo3LWLoPntC"),
+      ("572e4794", "3EFU7m"),
+      ("ecac89cad93923c02321", "EJDM8drfXA6uyA"),
+      ("10c8511e", "Rt5zm"),
+      ("00000000000000000000", "1111111111"),
+    ]
+    for (hex, expected) in vectors:
+      check base58Encode(fromHex(hex)) == expected
+
+  test "every byte of a 32-byte hash counts":
+    # The encoder used to fold the input into a 64-bit integer, so only the
+    # last 8 bytes survived and keys differing earlier collided.
+    var a = newSeq[byte](32)
+    var b = newSeq[byte](32)
+    for i in 0 ..< 32:
+      a[i] = byte(i + 1)
+      b[i] = byte(i + 1)
+    b[0] = 0xff
+    check base58Encode(a) != base58Encode(b)
+    check base58Encode(a).len >= 43
+
   test "base58Encode of zero bytes starts with 1s":
     let data = @[byte(0), 0, 1]
     let encoded = base58Encode(data)

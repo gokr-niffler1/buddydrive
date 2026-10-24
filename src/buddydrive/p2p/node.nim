@@ -10,6 +10,7 @@ import libp2p/multiaddress
 import libp2p/crypto/crypto
 import libp2p/nameresolving/dnsresolver
 import synchandler
+import addrs
 import ../types
 
 export results
@@ -28,7 +29,7 @@ type
     started*: bool
     startTime*: Time
 
-const BuddyDriveProtocol* = "/buddydrive/1.0.0"
+const BuddyDriveProtocol* = "/buddydrive/2.0.0"
 
 proc generateKeyPair*(): (PublicKey, PrivateKey) =
   var rng = newRng()
@@ -106,9 +107,7 @@ proc getAddrs*(node: BuddyNode): seq[MultiAddress] =
   result = node.peerInfo.addrs
 
 proc getAdvertisedAddrs*(node: BuddyNode): seq[MultiAddress] =
-  if node.announceAddrs.len > 0:
-    return node.announceAddrs
-  node.getAddrs()
+  publishableAddrs(node.announceAddrs, node.getAddrs())
 
 proc peerIdStr*(node: BuddyNode): string =
   $node.peerId

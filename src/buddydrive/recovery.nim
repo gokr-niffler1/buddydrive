@@ -245,26 +245,28 @@ proc hexToBytes*(hex: string): array[32, byte] =
     result[i] = byte(b)
 
 proc base58Encode*(data: seq[byte]): string =
-  const ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
-  var num = 0'u64
-  for b in data:
-    num = num * 256 + uint64(b)
-  
-  var chars: seq[char] = @[]
-  while num > 0:
-    let rem = num mod 58
-    num = num div 58
-    chars.add(ALPHABET[int(rem)])
-  
-  result = ""
-  for i in countdown(chars.len - 1, 0):
-    result.add(chars[i])
-  
-  for b in data:
-    if b == 0:
-      result = "1" & result
-    else:
-      break
+  ## Bitcoin-alphabet Base58 of the whole input. Each leading zero byte
+  ## becomes a "1"; the rest is converted as one big number.
+  const Alphabet = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+  var zeros = 0
+  while zeros < data.len and data[zeros] == 0:
+    inc zeros
+
+  var digits: seq[int] = @[]
+  for i in zeros ..< data.len:
+    var carry = int(data[i])
+    for j in 0 ..< digits.len:
+      carry += digits[j] shl 8
+      digits[j] = carry mod 58
+      carry = carry div 58
+    while carry > 0:
+      digits.add(carry mod 58)
+      carry = carry div 58
+
+  for _ in 0 ..< zeros:
+    result.add('1')
+  for j in countdown(digits.high, 0):
+    result.add(Alphabet[digits[j]])
 
 proc derivePublicKeyB58*(masterKey: array[32, byte]): string =
   var masterKeyStr = newString(32)

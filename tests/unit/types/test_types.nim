@@ -59,12 +59,12 @@ suite "AppConfig":
     check cfg.buddies.len == 0
 
 suite "ConnectionState":
-  test "ConnectionState enum values":
-    check $csDisconnected == "csDisconnected"
-    check $csConnecting == "csConnecting"
-    check $csConnected == "csConnected"
-    check $csSyncing == "csSyncing"
-    check $csError == "csError"
+  test "ConnectionState prints the names the GUIs expect":
+    check $csDisconnected == "disconnected"
+    check $csConnecting == "connecting"
+    check $csConnected == "connected"
+    check $csSyncing == "syncing"
+    check $csError == "error"
 
 suite "FileChangeKind":
   test "FileChangeKind enum values":

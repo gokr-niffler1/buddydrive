@@ -120,7 +120,7 @@ journalctl -u buddydrive -f
 | `buddydrive list-buddies` | List paired buddies |
 | `buddydrive connect <address>` | Manual connect placeholder |
 | `buddydrive start [--port <control-port>]` | Start sync daemon in the foreground |
-| `buddydrive stop` | Stop command (not yet implemented; use Ctrl+C) |
+| `buddydrive stop` | Ask the running daemon to shut down cleanly |
 | `buddydrive status` | Show configured folders, buddies, and sync time |
 | `buddydrive logs` | Show recent logs |
 | `buddydrive setup-recovery` | Generate and verify a 12-word recovery phrase, then sync encrypted config to the relay |
@@ -134,11 +134,13 @@ journalctl -u buddydrive -f
 |-----|-----------|-------------|
 | `api-base-url` | `<url>` | Set API base URL for discovery and config sync |
 | `relay-region` | `<region>` | Set relay region (eu, us, local) |
-| `storage-base-path` | `<path>` | Set base path for storing buddy files |
+| `storage-base-path` | `<path>` | Base folder for buddies without their own `buddy-storage-path` (default `~/.buddydrive/storage`) |
 | `bandwidth-limit` | `<kbps>` | Set bandwidth limit (0 = unlimited) |
 | `buddy-pairing-code` | `<buddy-id> <code>` | Set pairing code for a buddy |
 | `buddy-name` | `<name>` | Update your buddy display name |
 | `buddy-sync-time` | `<buddy-id> <HH:MM>` | Set per-buddy sync time (empty = always) |
+| `buddy-addresses` | `<buddy-id> <multiaddr[,multiaddr]\|none>` | Known addresses for a buddy, dialed before discovered ones (e.g. a buddy on your LAN) |
+| `buddy-storage-path` | `<buddy-id> <path\|default>` | Folder where this buddy's backups are kept on your machine |
 | `folder-append-only` | `<folder-name> <on\|off>` | Toggle folder append-only mode |
 
 ### add-folder Options
@@ -169,7 +171,7 @@ journalctl -u buddydrive -f
 
 - `buddydrive init --with-recovery` is shown in help but not implemented; use `init` then `setup-recovery` separately
 - `buddydrive start --daemon` currently prints a note and continues in the foreground
-- `buddydrive stop` is not implemented yet; use your process manager or `Ctrl+C`
+- `buddydrive stop`, `Ctrl+C` and SIGTERM (e.g. `systemctl stop`) all shut down cleanly: the daemon removes its discovery record and UPnP port mapping before exiting. A second `Ctrl+C` exits immediately
 - `buddydrive status` does not yet query the running daemon for live connection state
 - `buddydrive connect` does not perform a manual direct dial yet
 - `buddydrive recover` currently restores configuration from the relay path; the buddy fallback prompt is present, but that fetch path is not implemented yet
@@ -186,17 +188,15 @@ When you run `buddydrive init`, your instance gets:
 
 ### Pairing
 
-To sync folders with someone, both sides add each other:
+To sync folders with someone, you exchange Buddy IDs and then agree on **one** pairing code that both of you store:
 
-1. Generate a pairing code with `buddydrive add-buddy --generate-code`
-2. Share your Buddy ID and pairing code with your buddy
-3. Your buddy runs `buddydrive add-buddy --id <your-id> --code <pairing-code>`
-4. Repeat in reverse on the other side
+1. Exchange Buddy IDs (shown by `buddydrive config` or the GUI)
+2. One of you runs `buddydrive add-buddy --generate-code --id <their-id>`. This saves the buddy with a new code and prints the command to send them
+3. The other runs that command: `buddydrive add-buddy --id <your-id> --code <pairing-code>`
 
-The pairing code serves two purposes:
+In the GUIs, both of you use **Pair with Buddy**: one presses **Generate** and sends the code, the other enters it.
 
-- Confirms you are pairing with the right person
-- Acts as the shared secret for relay fallback
+Both sides must store the same code. It is the shared secret for the relationship: discovery records are stored and looked up under a key derived from it, and relay fallback uses it to match the two peers. Keep it private: anyone with the code can read your buddy's published address. It does not prove who is on the other end; only buddy IDs you have added can connect.
 
 ### Recovery and Restore
 
@@ -318,8 +318,24 @@ id = "buddy-id-here"
 name = "cranky-wrench"
 pairing_code = "ABCD-EFGH"
 sync_time = "03:00"
+storage_path = "/mnt/backup/cranky-wrench"
+addresses = ["/ip4/192.168.1.101/tcp/41721"]   # optional, see below
 added_at = "2026-04-10T12:00:00Z"
 ```
+
+### Buddies on the Same Network
+
+Discovery records only carry public addresses (plus any `announce_addr`); private LAN addresses are never published. If a buddy is on your own network, for example while testing, give each side the other's LAN address:
+
+```bash
+buddydrive config set buddy-addresses <buddy-id> /ip4/192.168.1.101/tcp/41721
+```
+
+Those addresses are dialed first. The buddy still has to be found through discovery once, since that is where its peer ID comes from.
+
+### Where a Buddy's Files Are Kept
+
+Every buddy gets a storage folder of its own on your machine: `storage_path` if you set one, otherwise `<storage_base_path>/<buddy-id>` (by default `~/.buddydrive/storage/<buddy-id>`). Each folder the buddy shares with you lives in a sub-folder named by its folder id, so a buddy's `docs` never mixes with your own `docs`. Encrypted folders hold only opaque `.blob` files and small `.meta` sidecars; you cannot read their names or contents. Unencrypted folders are stored as normal files you can browse.
 
 ### Data Files
 

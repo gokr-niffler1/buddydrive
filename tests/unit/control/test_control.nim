@@ -1,6 +1,7 @@
 import std/[json, os, strutils, unittest]
 import ../../../src/buddydrive/config as buddyconfig
 import ../../../src/buddydrive/control
+import ../../../src/buddydrive/types
 import ../../testutils
 
 proc responseJson(response: string): JsonNode =
@@ -200,3 +201,80 @@ suite "control API handlers":
       let response = handleRequest("POST /recovery/sync-config HTTP/1.1\r\n\r\n")
       check responseStatus(response) == 400
       check responseJson(response)["code"].getStr() == "NOT_SETUP"
+
+suite "Folder endpoints":
+  proc post(path: string, body: JsonNode): string =
+    handleRequest("POST " & path & " HTTP/1.1\r\nHost: localhost\r\n\r\n" & $body)
+
+  test "adding a folder gives it an id and a key":
+    withTestDir("control_add_folder"):
+      initTestConfig(testDir)
+      defer:
+        delEnv("BUDDYDRIVE_CONFIG_DIR")
+        delEnv("BUDDYDRIVE_DATA_DIR")
+      let response = post("/folders", %*{"name": "docs", "path": testDir, "appendOnly": true,
+        "buddies": ["buddy-1"]})
+      check responseStatus(response) == 200
+      let folder = buddyconfig.loadConfig().folders[0]
+      check folder.id.len > 0
+      check folder.hasUsableKey()
+      check folder.encrypted
+      check folder.appendOnly
+      check folder.buddies == @["buddy-1"]
+      check responseStatus(post("/folders", %*{"name": "docs", "path": testDir})) == 409
+
+  test "updating a folder changes sharing but keeps its id and key":
+    withTestDir("control_update_folder"):
+      initTestConfig(testDir)
+      defer:
+        delEnv("BUDDYDRIVE_CONFIG_DIR")
+        delEnv("BUDDYDRIVE_DATA_DIR")
+      discard post("/folders", %*{"name": "docs", "path": testDir})
+      let before = buddyconfig.loadConfig().folders[0]
+      let response = post("/folders/update", %*{"id": before.id, "name": "papers",
+        "path": testDir, "appendOnly": true, "buddies": ["buddy-2"]})
+      check responseStatus(response) == 200
+      let after = buddyconfig.loadConfig().folders[0]
+      check after.name == "papers"
+      check after.appendOnly
+      check after.buddies == @["buddy-2"]
+      check after.id == before.id
+      check after.folderKey == before.folderKey
+      check responseStatus(post("/folders/update", %*{"id": "missing"})) == 404
+
+  test "POST /config keeps folder keys and buddy settings":
+    withTestDir("control_config_keeps_keys"):
+      initTestConfig(testDir)
+      defer:
+        delEnv("BUDDYDRIVE_CONFIG_DIR")
+        delEnv("BUDDYDRIVE_DATA_DIR")
+      discard post("/folders", %*{"name": "docs", "path": testDir})
+      var cfg = buddyconfig.loadConfig()
+      var buddy: BuddyInfo
+      buddy.id = newBuddyId("buddy-1", "carol")
+      buddy.storagePath = testDir / "carol"
+      buddy.addresses = @["/ip4/192.168.1.101/tcp/41721"]
+      cfg.buddies = @[buddy]
+      buddyconfig.saveConfig(cfg)
+      let before = buddyconfig.loadConfig()
+
+      discard post("/config", %*{
+        "folders": [{"name": "docs", "path": testDir, "encrypted": true}],
+        "buddies": [{"id": "buddy-1", "name": "carol"}],
+      })
+      let after = buddyconfig.loadConfig()
+      check after.folders[0].id == before.folders[0].id
+      check after.folders[0].folderKey == before.folders[0].folderKey
+      check after.buddies[0].storagePath == testDir / "carol"
+      check after.buddies[0].addresses == @["/ip4/192.168.1.101/tcp/41721"]
+
+  test "folder names with spaces can be removed":
+    withTestDir("control_remove_spaced"):
+      initTestConfig(testDir)
+      defer:
+        delEnv("BUDDYDRIVE_CONFIG_DIR")
+        delEnv("BUDDYDRIVE_DATA_DIR")
+      discard post("/folders", %*{"name": "Okrypterade filer", "path": testDir})
+      let response = handleRequest("DELETE /folders/Okrypterade%20filer HTTP/1.1\r\n\r\n")
+      check responseStatus(response) == 200
+      check buddyconfig.loadConfig().folders.len == 0

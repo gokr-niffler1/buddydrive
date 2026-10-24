@@ -4,7 +4,9 @@ import std/times
 import std/strutils
 import std/sequtils
 import parsetoml
+import uuids
 import types
+import crypto
 import logutils
 
 export newAppConfig
@@ -122,7 +124,11 @@ proc configToToml*(config: AppConfig, includeHeader = false): string =
       result.add("pairing_code = \"" & escapeToml(buddy.pairingCode) & "\"\n")
       if buddy.syncTime.len > 0:
         result.add("sync_time = \"" & escapeToml(buddy.syncTime) & "\"\n")
-      result.add("added_at = \"" & buddy.addedAt.format("yyyy-MM-dd'T'HH:mm:ss'Z'") & "\"\n")
+      if buddy.storagePath.len > 0:
+        result.add("storage_path = \"" & escapeToml(buddy.storagePath) & "\"\n")
+      if buddy.addresses.len > 0:
+        result.add("addresses = [" & buddy.addresses.mapIt("\"" & escapeToml(it) & "\"").join(", ") & "]\n")
+      result.add("added_at = \"" & buddy.addedAt.utc.format("yyyy-MM-dd'T'HH:mm:ss'Z'") & "\"\n")
 
 proc parseConfigToml*(toml: TomlValueRef): AppConfig =
   result.buddy.uuid = toml["buddy"]["id"].getStr()
@@ -175,6 +181,11 @@ proc parseConfigToml*(toml: TomlValueRef): AppConfig =
       buddy.id.name = buddyTbl{"name"}.getStr("")
       buddy.pairingCode = buddyTbl{"pairing_code"}.getStr("")
       buddy.syncTime = buddyTbl{"sync_time"}.getStr("")
+      buddy.storagePath = buddyTbl{"storage_path"}.getStr("")
+      buddy.addresses = @[]
+      if "addresses" in buddyTbl:
+        for address in buddyTbl["addresses"].getElems():
+          buddy.addresses.add(address.getStr())
       buddy.addedAt = parseTime(buddyTbl{"added_at"}.getStr("1970-01-01T00:00:00Z"), "yyyy-MM-dd'T'HH:mm:ss'Z'", utc())
       result.buddies.add(buddy)
 
@@ -244,6 +255,41 @@ proc getFolder*(config: AppConfig, name: string): int =
     if folder.name == name:
       return i
   return -1
+
+proc newSyncFolder*(name, path: string, encrypted = true): FolderConfig =
+  ## The only way folders should be created. A folder needs a stable id so a
+  ## rename does not orphan its backup, and its own key: an "encrypted" folder
+  ## without one would go to the buddy in plain form.
+  result = newFolderConfig(name, path, encrypted)
+  result.id = $genUuid()
+  result.folderKey = generateKey()
+
+proc hasUsableKey*(folder: FolderConfig): bool =
+  folder.folderKey.len == KeySize
+
+proc ensureFolderIdentities*(config: var AppConfig): seq[string] =
+  ## Gives folders created without an id or key (older GUIs did this) the ones
+  ## they should have had. Returns what was changed, for logging.
+  for folder in config.folders.mitems:
+    if folder.id.len == 0:
+      folder.id = $genUuid()
+      result.add("folder " & folder.name & " had no id; assigned " & folder.id)
+    if not folder.hasUsableKey():
+      folder.folderKey = generateKey()
+      result.add("folder " & folder.name & " had no encryption key; generated one" &
+        (if folder.encrypted: ". Files already sent to a buddy from it were not encrypted" else: ""))
+
+proc storageBaseDir*(config: AppConfig): string =
+  if config.storageBasePath.len > 0:
+    config.storageBasePath
+  else:
+    getDataDir() / "storage"
+
+proc buddyStorageRoot*(config: AppConfig, buddyId: string): string =
+  for buddy in config.buddies:
+    if buddy.id.uuid == buddyId and buddy.storagePath.len > 0:
+      return buddy.storagePath
+  config.storageBaseDir() / buddyId
 
 proc getBuddy*(config: AppConfig, uuid: string): int =
   for i, buddy in config.buddies:

@@ -1,8 +1,9 @@
-import std/[json, net, os, random, strutils, tables, times, options]
+import std/[json, net, os, strutils, tables, times, options, uri]
 import chronos
 import db_connector/db_sqlite
 import types
 import config
+import crypto
 import control_web
 import recovery
 import sync/config_sync
@@ -93,7 +94,7 @@ proc writeLiveStatus*(buddyStatuses: seq[BuddyStatus], folderStatuses: seq[SyncS
       db.exec(sql"""
         INSERT INTO buddy_state (id, name, state, latency_ms, last_activity)
         VALUES (?, ?, ?, ?, ?)
-      """, b.id, b.name, $b.state, b.latencyMs, b.lastSync.format("yyyy-MM-dd'T'HH:mm:ss'Z'"))
+      """, b.id, b.name, $b.state, b.latencyMs, b.lastSync.utc.format("yyyy-MM-dd'T'HH:mm:ss'Z'"))
     
     db.exec(sql"DELETE FROM folder_state")
     for f in folderStatuses:
@@ -167,7 +168,7 @@ proc parseRequest*(raw: string): tuple[httpMethod: string, path: string, body: s
   let requestLine = head[0].split(" ")
   if requestLine.len >= 2:
     result.httpMethod = requestLine[0]
-    result.path = requestLine[1]
+    result.path = decodeUrl(requestLine[1], decodePlus = false)
   if parts.len > 1:
     result.body = parts[1]
 
@@ -252,10 +253,43 @@ proc buddiesJson(): JsonNode =
       "pairingCode": buddy.pairingCode,
       "state": "disconnected",
       "latencyMs": -1,
-      "lastSync": buddy.addedAt.format("yyyy-MM-dd'T'HH:mm:ss'Z'"),
+      "lastSync": buddy.addedAt.utc.format("yyyy-MM-dd'T'HH:mm:ss'Z'"),
       "syncTime": buddy.syncTime
     })
   %*{"buddies": buddies}
+
+proc storageUsage(root: string): tuple[files: int, bytes: int64] =
+  if not dirExists(root):
+    return
+  for path in walkDirRec(root, relative = false):
+    if path.endsWith(".buddytmp"):
+      continue
+    if path.endsWith(".meta"):
+      inc result.files
+      continue
+    try:
+      result.bytes += getFileSize(path)
+    except CatchableError:
+      discard
+    if not path.endsWith(".blob"):
+      inc result.files
+
+proc storageJson(): JsonNode =
+  if not config.configExists():
+    return %*{"storage": []}
+  let cfg = config.loadConfig()
+  var entries: seq[JsonNode] = @[]
+  for buddy in cfg.buddies:
+    let root = cfg.buddyStorageRoot(buddy.id.uuid)
+    let usage = storageUsage(root)
+    entries.add(%*{
+      "buddyId": buddy.id.uuid,
+      "buddyName": buddy.id.name,
+      "path": root,
+      "files": usage.files,
+      "bytes": usage.bytes,
+    })
+  %*{"storage": entries}
 
 proc foldersJson(): JsonNode =
   var liveFolders: Table[string, JsonNode] = initTable[string, JsonNode]()
@@ -281,6 +315,7 @@ proc foldersJson(): JsonNode =
   var folders: seq[JsonNode] = @[]
   for folder in cfg.folders:
     var folderJson = %*{
+      "id": folder.id,
       "name": folder.name,
       "path": folder.path,
       "encrypted": folder.encrypted,
@@ -319,7 +354,7 @@ proc configJson(): JsonNode =
       "name": buddy.id.name,
       "pairing_code": buddy.pairingCode,
       "sync_time": buddy.syncTime,
-      "addedAt": buddy.addedAt.format("yyyy-MM-dd'T'HH:mm:ss'Z'"),
+      "addedAt": buddy.addedAt.utc.format("yyyy-MM-dd'T'HH:mm:ss'Z'"),
       "syncTime": buddy.syncTime
     })
   %*{
@@ -352,32 +387,59 @@ proc logsJson(): JsonNode =
   %*{"logs": logs}
 
 proc pairingCodeJson(): JsonNode =
-  const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
-  randomize()
-  var code = ""
-  for _ in 0 .. 3:
-    code.add(chars[rand(chars.high)])
-  code.add('-')
-  for _ in 0 .. 3:
-    code.add(chars[rand(chars.high)])
+  let code = generatePairingCode()
   let cfg = config.loadConfig()
   %*{
     "buddyId": cfg.buddy.uuid,
     "buddyName": cfg.buddy.name,
-    "pairingCode": code,
-    "expiresAt": (getTime() + initDuration(minutes = 5)).format("yyyy-MM-dd'T'HH:mm:ss'Z'")
+    "pairingCode": code
   }
 
 proc addFolderFromBody(body: string): tuple[status: int, response: JsonNode] =
   let parsed = parseJson(body)
   var cfg = config.loadConfig()
-  var folder = newFolderConfig(parsed{"name"}.getStr(""), parsed{"path"}.getStr(""), parsed{"encrypted"}.getBool(true))
+  var folder = newSyncFolder(parsed{"name"}.getStr(""), parsed{"path"}.getStr(""), parsed{"encrypted"}.getBool(true))
   if folder.name.len == 0 or folder.path.len == 0:
     return (400, %*{"error": "name and path are required", "code": "INVALID_REQUEST"})
+  if cfg.getFolder(folder.name) >= 0:
+    return (409, %*{"error": "A folder with that name already exists", "code": "FOLDER_EXISTS"})
+  folder.appendOnly = parsed{"appendOnly"}.getBool(parsed{"append_only"}.getBool(false))
   if parsed.hasKey("buddies"):
     for item in parsed["buddies"]:
       folder.buddies.add(item.getStr())
   cfg.addFolder(folder)
+  (200, %*{"ok": true})
+
+proc updateFolderFromBody(body: string): tuple[status: int, response: JsonNode] =
+  ## Changes a folder's name, path, sharing or append-only flag. Encryption is
+  ## left alone: switching it would orphan what the buddy already stores.
+  let parsed = parseJson(body)
+  let folderId = parsed{"id"}.getStr("")
+  var cfg = config.loadConfig()
+  var idx = -1
+  for i, folder in cfg.folders:
+    if folderId.len > 0 and folder.id == folderId:
+      idx = i
+  if idx < 0:
+    return (404, %*{"error": "Folder not found", "code": "FOLDER_NOT_FOUND"})
+
+  let name = parsed{"name"}.getStr(cfg.folders[idx].name)
+  let path = parsed{"path"}.getStr(cfg.folders[idx].path)
+  if name.len == 0 or path.len == 0:
+    return (400, %*{"error": "name and path are required", "code": "INVALID_REQUEST"})
+  for i, folder in cfg.folders:
+    if i != idx and folder.name == name:
+      return (409, %*{"error": "A folder with that name already exists", "code": "FOLDER_EXISTS"})
+
+  cfg.folders[idx].name = name
+  cfg.folders[idx].path = path
+  if parsed.hasKey("appendOnly"):
+    cfg.folders[idx].appendOnly = parsed["appendOnly"].getBool(false)
+  if parsed.hasKey("buddies"):
+    cfg.folders[idx].buddies = @[]
+    for item in parsed["buddies"]:
+      cfg.folders[idx].buddies.add(item.getStr())
+  config.saveConfig(cfg)
   (200, %*{"ok": true})
 
 proc removeFolderByName(name: string): tuple[status: int, response: JsonNode] =
@@ -420,11 +482,19 @@ proc updateConfigFromBody(body: string): tuple[status: int, response: JsonNode] 
   if parsed.hasKey("folders"):
     cfg.folders = @[]
     for item in parsed["folders"].getElems():
-      var folder = newFolderConfig(
+      var folder = newSyncFolder(
         item{"name"}.getStr(""),
         item{"path"}.getStr(""),
         item{"encrypted"}.getBool(true)
       )
+      # An existing folder keeps its id and key; replacing the key would make
+      # its backup unreadable.
+      let itemId = item{"id"}.getStr("")
+      for existing in oldCfg.folders:
+        if (itemId.len > 0 and existing.id == itemId) or (itemId.len == 0 and existing.name == folder.name):
+          folder.id = existing.id
+          folder.folderKey = existing.folderKey
+          break
       folder.appendOnly = item{"append_only"}.getBool(false)
       if item.hasKey("buddies"):
         for buddyId in item["buddies"].getElems():
@@ -446,6 +516,8 @@ proc updateConfigFromBody(body: string): tuple[status: int, response: JsonNode] 
       for oldBuddy in oldCfg.buddies:
         if oldBuddy.id.uuid == buddyId:
           buddy.addedAt = oldBuddy.addedAt
+          buddy.storagePath = oldBuddy.storagePath
+          buddy.addresses = oldBuddy.addresses
           break
       if item.hasKey("addedAt"):
         try:
@@ -478,10 +550,17 @@ proc pairBuddyFromBody(body: string): tuple[status: int, response: JsonNode] =
   
   var cfg = config.loadConfig()
   var buddy: BuddyInfo
-  buddy.id = newBuddyId(buddyId, buddyName)
+  let idx = cfg.getBuddy(buddyId)
+  if idx >= 0:
+    buddy = cfg.buddies[idx]
+  else:
+    buddy.id.uuid = buddyId
+    buddy.addedAt = getTime()
+  if buddyName.len > 0 or idx < 0:
+    buddy.id.name = buddyName
   buddy.pairingCode = code
-  buddy.syncTime = parsed{"sync_time"}.getStr("")
-  buddy.addedAt = getTime()
+  if parsed.hasKey("sync_time"):
+    buddy.syncTime = parsed{"sync_time"}.getStr("")
   cfg.addBuddy(buddy)
   (200, %*{"ok": true, "message": "Buddy paired successfully"})
 
@@ -599,6 +678,7 @@ proc handleRequest*(raw: string): string =
       of "/status": jsonResponse(200, statusJson())
       of "/buddies": jsonResponse(200, buddiesJson())
       of "/folders": jsonResponse(200, foldersJson())
+      of "/storage": jsonResponse(200, storageJson())
       of "/config": jsonResponse(200, configJson())
       of "/logs": jsonResponse(200, logsJson())
       of "/recovery":
@@ -617,6 +697,9 @@ proc handleRequest*(raw: string): string =
       of "/config/reload":
         discard config.loadConfig()
         jsonResponse(200, %*{"ok": true})
+      of "/folders/update":
+        let resp = updateFolderFromBody(req.body)
+        jsonResponse(resp.status, resp.response)
       of "/folders":
         let resp = addFolderFromBody(req.body)
         jsonResponse(resp.status, resp.response)

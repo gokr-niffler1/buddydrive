@@ -29,6 +29,9 @@ type
     case kind*: MessageKind
     of msgFileList:
       folderName*: string
+      folderId*: string
+      folderEncrypted*: bool
+      folderAppendOnly*: bool
       files*: seq[FileEntry]
     of msgFileRequest:
       requestPath*: string
@@ -51,9 +54,9 @@ type
       newPath*: string
       moveHash*: string
     of msgListPathsRequest:
-      listFolderName*: string
+      listFolderId*: string
     of msgListPathsResponse:
-      listResponseFolderName*: string
+      listResponseFolderId*: string
       listFiles*: seq[FileEntry]
     of msgPing:
       timestamp*: int64
@@ -74,7 +77,7 @@ type
     symlinkTarget*: string
 
 const
-  ProtocolVersion*: uint8 = 4
+  ProtocolVersion*: uint8 = 5
   MaxMessageSize*: int = 1024 * 1024 * 30  # 30MB max
   ChunkSize*: int = 64 * 1024  # 64KB chunks
 
@@ -145,6 +148,9 @@ proc encode*(msg: ProtocolMessage): seq[byte] =
   case msg.kind
   of msgFileList:
     result.addString(msg.folderName)
+    result.addString(msg.folderId)
+    result.add(msg.folderEncrypted.byte)
+    result.add(msg.folderAppendOnly.byte)
     result.add(msg.files.len.uint32.encodeInt())
     for f in msg.files:
       result.addString(f.path)
@@ -182,10 +188,10 @@ proc encode*(msg: ProtocolMessage): seq[byte] =
     result.addString(msg.moveHash)
 
   of msgListPathsRequest:
-    result.addString(msg.listFolderName)
+    result.addString(msg.listFolderId)
 
   of msgListPathsResponse:
-    result.addString(msg.listResponseFolderName)
+    result.addString(msg.listResponseFolderId)
     result.add(msg.listFiles.len.uint32.encodeInt())
     for f in msg.listFiles:
       result.addString(f.path)
@@ -236,7 +242,17 @@ proc decode*(data: seq[byte]): Result[ProtocolMessage, string] =
     if folderNameRes.isErr:
       return err(folderNameRes.error)
     msg.folderName = folderNameRes.get()
-    
+
+    let folderIdRes = readString(data, pos)
+    if folderIdRes.isErr:
+      return err(folderIdRes.error)
+    msg.folderId = folderIdRes.get()
+
+    checkLen(2)
+    msg.folderEncrypted = data[pos] != 0
+    msg.folderAppendOnly = data[pos + 1] != 0
+    pos += 2
+
     checkLen(4)
     let fileCount = readUint32(data, pos).int
     pos += 4
@@ -346,16 +362,16 @@ proc decode*(data: seq[byte]): Result[ProtocolMessage, string] =
     msg.moveHash = moveHashRes.get()
 
   of msgListPathsRequest:
-    let listFolderNameRes = readString(data, pos)
-    if listFolderNameRes.isErr:
-      return err(listFolderNameRes.error)
-    msg.listFolderName = listFolderNameRes.get()
+    let listFolderIdRes = readString(data, pos)
+    if listFolderIdRes.isErr:
+      return err(listFolderIdRes.error)
+    msg.listFolderId = listFolderIdRes.get()
 
   of msgListPathsResponse:
-    let listResponseFolderNameRes = readString(data, pos)
-    if listResponseFolderNameRes.isErr:
-      return err(listResponseFolderNameRes.error)
-    msg.listResponseFolderName = listResponseFolderNameRes.get()
+    let listResponseFolderIdRes = readString(data, pos)
+    if listResponseFolderIdRes.isErr:
+      return err(listResponseFolderIdRes.error)
+    msg.listResponseFolderId = listResponseFolderIdRes.get()
 
     checkLen(4)
     let fileCount = readUint32(data, pos).int
@@ -415,8 +431,21 @@ proc decode*(data: seq[byte]): Result[ProtocolMessage, string] =
   
   ok(msg)
 
-proc newFileList*(folderName: string, files: seq[FileEntry]): ProtocolMessage =
-  ProtocolMessage(kind: msgFileList, folderName: folderName, files: files)
+proc newFileList*(
+    folderName: string,
+    files: seq[FileEntry],
+    folderId = "",
+    encrypted = false,
+    appendOnly = false,
+): ProtocolMessage =
+  ProtocolMessage(
+    kind: msgFileList,
+    folderName: folderName,
+    folderId: folderId,
+    folderEncrypted: encrypted,
+    folderAppendOnly: appendOnly,
+    files: files,
+  )
 
 proc newFileRequest*(path: string, offset: int64 = 0, length: int = -1): ProtocolMessage =
   ProtocolMessage(kind: msgFileRequest, requestPath: path, requestOffset: offset, requestLength: length)
@@ -427,7 +456,7 @@ proc newFileData*(
     totalSize: int64,
     done: bool = false,
     compression: CompressionKind = ckNone,
-    originalLen: int = 0,
+    originalLen: int = -1,
 ): ProtocolMessage =
   ProtocolMessage(
     kind: msgFileData,
@@ -436,7 +465,7 @@ proc newFileData*(
     totalSize: totalSize,
     done: done,
     dataCompression: compression,
-    dataOriginalLen: if originalLen > 0: originalLen else: data.len
+    dataOriginalLen: if originalLen >= 0: originalLen else: data.len
   )
 
 proc newFileAck*(success: bool, bytesReceived: int64 = 0): ProtocolMessage =
@@ -448,11 +477,11 @@ proc newFileDelete*(path: string): ProtocolMessage =
 proc newMoveFile*(oldPath: string, newPath: string, hash: string): ProtocolMessage =
   ProtocolMessage(kind: msgMoveFile, oldPath: oldPath, newPath: newPath, moveHash: hash)
 
-proc newListPathsRequest*(folderName: string): ProtocolMessage =
-  ProtocolMessage(kind: msgListPathsRequest, listFolderName: folderName)
+proc newListPathsRequest*(folderId: string): ProtocolMessage =
+  ProtocolMessage(kind: msgListPathsRequest, listFolderId: folderId)
 
-proc newListPathsResponse*(folderName: string, files: seq[FileEntry]): ProtocolMessage =
-  ProtocolMessage(kind: msgListPathsResponse, listResponseFolderName: folderName, listFiles: files)
+proc newListPathsResponse*(folderId: string, files: seq[FileEntry]): ProtocolMessage =
+  ProtocolMessage(kind: msgListPathsResponse, listResponseFolderId: folderId, listFiles: files)
 
 proc newPing*(): ProtocolMessage =
   ProtocolMessage(kind: msgPing, timestamp: getTime().toUnix())

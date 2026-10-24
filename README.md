@@ -141,17 +141,15 @@ When you run `buddydrive init`, your instance gets:
 
 ### Pairing
 
-To sync folders with someone, both sides add each other:
+To sync folders with someone, you exchange Buddy IDs and then agree on **one** pairing code that both of you store:
 
-1. Generate a pairing code with `buddydrive add-buddy --generate-code`
-2. Share your Buddy ID and pairing code with your buddy
-3. Your buddy runs `buddydrive add-buddy --id <your-id> --code <pairing-code>`
-4. Repeat in reverse on the other side
+1. Exchange Buddy IDs (shown by `buddydrive config` or the GUI)
+2. One of you runs `buddydrive add-buddy --generate-code --id <their-id>`. This saves the buddy with a new code and prints the command to send them
+3. The other runs that command: `buddydrive add-buddy --id <your-id> --code <pairing-code>`
 
-The pairing code serves two purposes:
+In the GUIs, both of you use **Pair with Buddy**: one presses **Generate** and sends the code, the other enters it.
 
-- Confirms you are pairing with the right person
-- Acts as the shared secret for relay fallback
+Both sides must store the same code. It is the shared secret for the relationship: discovery records are stored and looked up under a key derived from it, and relay fallback uses it to match the two peers. Keep it private: anyone with the code can read your buddy's published address. It does not prove who is on the other end; only buddy IDs you have added can connect.
 
 ### Recovery And Restore
 
