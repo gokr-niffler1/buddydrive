@@ -295,10 +295,40 @@ See `docs/PLAN.md` for full details. Key points:
 
 ## Testing
 
-Tests use `std/unittest` and run via testament with `nimble test`:
+Tests use `std/unittest` and run through `tests/testrunner.nim`, a small
+parallel runner that replaces `testament pattern`:
 
-- **Unit tests**: `tests/unit/*/*.nim` — 16 test files covering config, crypto, recovery, messages, policy, scanner, transfer crash safety, control, control_web, rawrelay, index, pairing, types, config_sync, discovery, session
-- **Integration tests**: `tests/integration/*.nim` — 5 test files covering CLI flows, config sync e2e, relay fallback, relay file sync, pairing
+- `nimble test` — unit and integration suites, in parallel
+- `nimble testUnit` / `nimble testIntegration` — one group
+- `nimble test<Suite>` — one file or directory
+- `nimble testSerial` — the same suites one at a time through testament, for
+  bisecting a failure that only shows up in parallel
+
+The runner keeps testament's per-test nimcache layout, so a repeat run only
+recompiles what changed, and it compiles and runs several tests at once
+(unit: cores-1, integration: 4, because the integration tests bind ports and
+drive real daemons). A test that runs longer than `--timeout:` seconds (300 by
+default) is killed and reported as a failure instead of hanging the suite.
+
+Used directly:
+
+```
+nim c --hints:off -o:testresults/testrunner tests/testrunner.nim
+testresults/testrunner pattern "tests/unit/*/*.nim"
+testresults/testrunner pattern "tests/unit/session/*.nim" --jobs:4
+testresults/testrunner pattern "tests/unit/*/*.nim" --filter:session
+testresults/testrunner pattern "tests/integration/*.nim" --verbose
+```
+
+Tests have to stay safe to run in parallel: take ports from `freePort()`, which
+reserves the number across test processes, never a fixed port; keep state in
+`useIsolatedDataDir` or `withTestDir` paths, never in `~/.buddydrive` or a
+fixed temp name; and do not assume a sibling test has not run. The runner
+builds the `buddydrive` binary that the integration tests shell out to once,
+into `testresults/bin/`, and passes the path in `BUDDYDRIVE_TEST_CLI`.
+
+- **Unit tests**: `tests/unit/*/*.nim` — 17 test files covering config, crypto, recovery, messages, policy, scanner, transfer crash safety, control, control_web, rawrelay, index, pairing, types, config_sync, discovery, session, addrs, storage
+- **Integration tests**: `tests/integration/*.nim` — 6 test files covering CLI flows, config sync e2e, relay fallback, relay file sync, pairing, direct file sync, daemon shutdown
 
 Integration tests are self-contained: they start their own services in-process
 and fail rather than skip. Never reintroduce a "skip on error" wrapper — it hid

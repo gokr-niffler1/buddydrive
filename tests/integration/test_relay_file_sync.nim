@@ -12,6 +12,7 @@ import ../testutils
 import ../support/sync_fixtures
 
 useIsolatedDataDir("relay_file_sync")
+shortenSessionTimeouts()
 
 proc relayConfig(
     selfId: string,

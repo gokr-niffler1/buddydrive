@@ -15,6 +15,7 @@ import ../../testutils
 import ../../support/sync_fixtures
 
 useIsolatedDataDir("session")
+shortenSessionTimeouts()
 
 proc runBridgeSync(cfg1: AppConfig, cfg2: AppConfig, report: SessionReport = nil): Future[tuple[leftOk: bool, rightOk: bool]] {.async.} =
   let (left, right) = bridgedConnections(closeTogether = false)
@@ -840,6 +841,13 @@ suite "Session end":
       cfg.buddies = @[buddy]
 
       proc run(cfg: AppConfig): Future[tuple[sawSessionEnd: bool, waitedForUs: bool, ok: bool]] {.async.} =
+        # The session-end window has to be comfortably longer than the pause
+        # below, so "not finished yet" means it is waiting for us rather than
+        # having given up already.
+        let savedEnd = sessionEndTimeout
+        sessionEndTimeout = chronos.seconds(3)
+        defer: sessionEndTimeout = savedEnd
+
         let (left, right) = bridgedConnections(closeTogether = false)
         defer:
           await left.close()

@@ -49,9 +49,13 @@ proc sessionFailed(reason: string): bool =
   logSession("stopped: " & reason)
   false
 
-const
-  SessionEndTimeout = chronos.seconds(10)
-  SessionEndLingerTimeout = chronos.seconds(2)
+var
+  sessionEndTimeout* = chronos.seconds(10)
+    ## How long we wait for the buddy's session-end marker. A buddy that
+    ## predates the message never sends one, and the session still succeeds.
+  sessionEndLingerTimeout* = chronos.seconds(2)
+    ## How long the answering side waits for the buddy to hang up, so the last
+    ## marker is not cut off. Tests shorten it, as every session pays it.
 
 type
   FolderOutcome* = enum
@@ -466,15 +470,15 @@ proc awaitSessionEnd(conn: Connection, protocol: SyncProtocol, endsFirst: bool) 
       await protocol.sendMessage(conn, newSessionEnd())
     except CatchableError:
       return
-    discard await receiveSessionEnd(conn, protocol, SessionEndTimeout)
+    discard await receiveSessionEnd(conn, protocol, sessionEndTimeout)
   else:
-    discard await receiveSessionEnd(conn, protocol, SessionEndTimeout)
+    discard await receiveSessionEnd(conn, protocol, sessionEndTimeout)
     try:
       await protocol.sendMessage(conn, newSessionEnd())
     except CatchableError:
       return
     # Wait for the initiator to hang up before we do.
-    discard await receiveSessionEnd(conn, protocol, SessionEndLingerTimeout)
+    discard await receiveSessionEnd(conn, protocol, sessionEndLingerTimeout)
 
 
 proc syncBuddyFolders*(

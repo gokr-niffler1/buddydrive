@@ -6,7 +6,7 @@ import ../support/integration_harness
 var cliBinaryPath {.global.}: string
 
 proc ensureCliBinary(): string =
-  ensureBuiltBinary(cliBinaryPath, "buddydrive_test_cli", "nim c -o:$OUT src/buddydrive.nim")
+  ensureBuiltBinary(cliBinaryPath, "buddydrive_test_cli", "nim c --hints:off --warnings:off --nimCache:$CACHE -o:$OUT src/buddydrive.nim")
 
 proc cliEnv(testDir: string): StringTableRef =
   result = newStringTable()

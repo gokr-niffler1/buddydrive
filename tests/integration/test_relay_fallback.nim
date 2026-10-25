@@ -7,6 +7,7 @@ import ../support/test_relay
 import ../testutils
 
 useIsolatedDataDir("relay_fallback")
+shortenSessionTimeouts()
 
 proc makeConfig(
     selfId: string,

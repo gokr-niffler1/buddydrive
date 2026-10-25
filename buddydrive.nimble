@@ -21,69 +21,77 @@ requires "curly"                      # HTTP client (relay KV API, config sync)
 requires "https://github.com/gokr/lz4wrapper" # LZ4 compression (used by libp2p)
 requires "https://github.com/status-im/nim-zlib#daa8723" # zlib for libp2p; pinned because libp2p declares underspecified version
 
-task test, "Run all tests (automatic discovery via testament)":
+template runSuite(pattern: string) =
+  ## Build the runner once, then let it compile and run the pattern's test
+  ## files in parallel. It replaces `testament pattern`, which runs them one at
+  ## a time and so spends most of the suite recompiling chronos and libp2p for
+  ## every test binary.
+  exec "nim c --hints:off -o:testresults/testrunner tests/testrunner.nim"
+  exec "testresults/testrunner pattern " & quoteShell(pattern)
+
+task test, "Run all tests (parallel, via tests/testrunner.nim)":
   # No "|| true" here: a failing suite must fail the task.
-  exec """
-    echo "Running BuddyDrive test suite..."
-    echo "=== Unit tests ==="
-    testament pattern "tests/unit/*/*.nim"
-    echo "=== Integration tests ==="
-    testament pattern "tests/integration/*.nim"
-  """
+  runSuite("tests/unit/*/*.nim")
+  runSuite("tests/integration/*.nim")
 
 task testUnit, "Run unit tests":
-  exec "testament pattern \"tests/unit/*/*.nim\""
-
-task testTypes, "Run types tests":
-  exec "testament pattern \"tests/unit/types/*.nim\""
-
-task testRecovery, "Run recovery tests":
-  exec "testament pattern \"tests/unit/recovery/*.nim\""
-
-task testCrypto, "Run crypto tests":
-  exec "testament pattern \"tests/unit/crypto/*.nim\""
-
-task testConfig, "Run config tests":
-  exec "testament pattern \"tests/unit/config/*.nim\""
-
-task testPolicy, "Run sync policy tests":
-  exec "testament pattern \"tests/unit/policy/*.nim\""
-
-task testAddrs, "Run address selection tests":
-  exec "testament pattern \"tests/unit/addrs/*.nim\""
-
-task testScanner, "Run scanner tests":
-  exec "testament pattern \"tests/unit/scanner/*.nim\""
-
-task testIndex, "Run file index tests":
-  exec "testament pattern \"tests/unit/index/*.nim\""
-
-task testMessages, "Run protocol message tests":
-  exec "testament pattern \"tests/unit/messages/*.nim\""
-
-task testConfigSync, "Run config sync tests":
-  exec "testament pattern \"tests/unit/config_sync/*.nim\""
-
-task testControl, "Run control API tests":
-  exec "testament pattern \"tests/unit/control/*.nim\""
-
-task testControlWeb, "Run control web helper tests":
-  exec "testament pattern \"tests/unit/control_web/*.nim\""
-
-task testRawRelay, "Run raw relay helper tests":
-  exec "testament pattern \"tests/unit/rawrelay/*.nim\""
-
-task testPairing, "Run pairing unit tests":
-  exec "testament pattern \"tests/unit/pairing/*.nim\""
-
-task testTransfer, "Run transfer crash-safety tests":
-  exec "testament pattern \"tests/unit/scanner/test_transfer_crash_safety.nim\""
-
-task testCli, "Run CLI integration tests":
-  exec "testament pattern \"tests/integration/test_cli_flows.nim\""
+  runSuite("tests/unit/*/*.nim")
 
 task testIntegration, "Run integration tests":
+  runSuite("tests/integration/*.nim")
+
+task testSerial, "Run every test one at a time, through testament":
+  # The reference runner: useful when a parallel-only failure needs bisecting.
+  exec "testament pattern \"tests/unit/*/*.nim\""
   exec "testament pattern \"tests/integration/*.nim\""
+
+task testTypes, "Run types tests":
+  runSuite("tests/unit/types/*.nim")
+
+task testRecovery, "Run recovery tests":
+  runSuite("tests/unit/recovery/*.nim")
+
+task testCrypto, "Run crypto tests":
+  runSuite("tests/unit/crypto/*.nim")
+
+task testConfig, "Run config tests":
+  runSuite("tests/unit/config/*.nim")
+
+task testPolicy, "Run sync policy tests":
+  runSuite("tests/unit/policy/*.nim")
+
+task testAddrs, "Run address selection tests":
+  runSuite("tests/unit/addrs/*.nim")
+
+task testScanner, "Run scanner tests":
+  runSuite("tests/unit/scanner/*.nim")
+
+task testIndex, "Run file index tests":
+  runSuite("tests/unit/index/*.nim")
+
+task testMessages, "Run protocol message tests":
+  runSuite("tests/unit/messages/*.nim")
+
+task testConfigSync, "Run config sync tests":
+  runSuite("tests/unit/config_sync/*.nim")
+
+task testControl, "Run control API tests":
+  runSuite("tests/unit/control/*.nim")
+
+task testControlWeb, "Run control web helper tests":
+  runSuite("tests/unit/control_web/*.nim")
+
+task testRawRelay, "Run raw relay helper tests":
+  runSuite("tests/unit/rawrelay/*.nim")
+
+task testPairing, "Run pairing unit tests":
+  runSuite("tests/unit/pairing/*.nim")
+
+task testTransfer, "Run transfer crash-safety tests":
+  runSuite("tests/unit/scanner/test_transfer_crash_safety.nim")
+
+task testCli, "Run CLI integration tests":
+  runSuite("tests/integration/test_cli_flows.nim")
 
 task build, "Build release CLI":
   exec "nim c -d:release src/buddydrive.nim"

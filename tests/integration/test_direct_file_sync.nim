@@ -13,6 +13,7 @@ import ../support/sync_fixtures
 import ../testutils
 
 useIsolatedDataDir("direct_file_sync")
+shortenSessionTimeouts()
 
 proc dialAndSync(cfg: AppConfig, listener: BuddyNode, port: int): Future[bool] {.async.} =
   let node = newBuddyNode(port)

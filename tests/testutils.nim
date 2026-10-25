@@ -1,4 +1,7 @@
 import std/[exitprocs, os, random, times]
+import chronos
+import ../src/buddydrive/p2p/protocol
+import ../src/buddydrive/sync/session
 
 proc setupTestDir*(baseName: string): string =
   randomize()
@@ -48,3 +51,14 @@ proc getKvApiUrl*(): string =
   ## Empty means "use the in-process KV stub"; set it to test against a real
   ## deployment instead.
   getEnv("BUDDYDRIVE_KV_API_URL", "")
+
+proc shortenSessionTimeouts*() =
+  ## A session always waits out the session-end timeout and the linger timeout
+  ## after its last message: ten seconds and two, because a real buddy may be
+  ## slow to answer. Twenty-odd tests each running a session adds minutes of
+  ## pure waiting to the suite, so shorten them. Fast tests deserve fast
+  ## timeouts, not a duplicate of the production constants.
+  messageIdleTimeout = chronos.milliseconds(500)
+  folderListTimeout = chronos.seconds(2)
+  sessionEndTimeout = chronos.milliseconds(200)
+  sessionEndLingerTimeout = chronos.milliseconds(100)

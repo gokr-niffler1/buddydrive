@@ -12,7 +12,7 @@ var cliBinaryPath {.global.}: string
 const PairingCode = "SHUT-DOWN2"
 
 proc ensureCliBinary(): string =
-  ensureBuiltBinary(cliBinaryPath, "buddydrive_test_shutdown", "nim c -o:$OUT src/buddydrive.nim")
+  ensureBuiltBinary(cliBinaryPath, "buddydrive_test_shutdown", "nim c --hints:off --warnings:off --nimCache:$CACHE -o:$OUT src/buddydrive.nim")
 
 proc daemonEnv(dir: string): StringTableRef =
   result = newStringTable()
