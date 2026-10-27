@@ -24,7 +24,7 @@ proc relayConfig(
   result.relayRegion = "local"
   result.apiBaseUrl = ""
 
-proc connectAndSync(config: AppConfig): Future[void] {.async.} =
+proc connectAndSync(config: AppConfig, takeover = false): Future[void] {.async.} =
   let cache = initRelayListCache()
   let relayConn = await connectViaRegionalRelay(
     cache,
@@ -36,11 +36,11 @@ proc connectAndSync(config: AppConfig): Future[void] {.async.} =
   bc.conn = relayConn.conn
   doAssert await bc.performHandshake(config)
   let protocol = newSyncProtocol()
-  doAssert await syncBuddyFolders(config, bc.buddyId, bc.conn, protocol)
+  doAssert await syncBuddyFolders(config, bc.buddyId, bc.conn, protocol, takeover = takeover)
   await bc.close()
 
-proc syncPeers(cfg1, cfg2: AppConfig) =
-  waitFor allFutures([connectAndSync(cfg1), connectAndSync(cfg2)])
+proc syncPeers(cfg1, cfg2: AppConfig, takeover = false) =
+  waitFor allFutures([connectAndSync(cfg1, takeover), connectAndSync(cfg2)])
 
 proc freshDirs(base: string, names: varargs[string]): seq[string] =
   removeDir(base)
@@ -100,7 +100,7 @@ suite "Relay file sync":
 
     var replacement = source
     replacement.path = dirs[2]
-    syncPeers(relayConfig(BuddyOne, BuddyTwo, tempBase / "a-stores", @[replacement]), cfgB)
+    syncPeers(relayConfig(BuddyOne, BuddyTwo, tempBase / "a-stores", @[replacement]), cfgB, takeover = true)
 
     check readFile(dirs[2] / "big.bin") == content
 
@@ -130,7 +130,7 @@ suite "Relay file sync":
 
     var replacement = source
     replacement.path = dirs[2]
-    syncPeers(relayConfig(BuddyOne, BuddyTwo, tempBase / "a-stores", @[replacement]), cfgB)
+    syncPeers(relayConfig(BuddyOne, BuddyTwo, tempBase / "a-stores", @[replacement]), cfgB, takeover = true)
     check readFile(dirs[2] / "new-name.txt") == "same content\n"
     check readFile(dirs[2] / "edit.txt") == "second\n"
     check not fileExists(dirs[2] / "old-name.txt")
