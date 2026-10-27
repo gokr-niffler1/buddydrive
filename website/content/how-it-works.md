@@ -202,7 +202,7 @@ Local HTTP server (default port 17521) for GUI communication. Localhost connecti
 - Buddy-backed config fetch for `recover` is not implemented yet (relay path works)
 - No delta sync for large files (partial-chunk diffs)
 - No selective download
-- `POST /sync/:folder` is a stub
+- A queued sync request is served by the running daemon only
 - Folder listings are one framed message (30 MB cap)
 
 ### Planned

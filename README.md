@@ -179,6 +179,14 @@ Restore happens in two layers:
 - **Config restore** - `buddydrive recover` fetches your encrypted config from the relay and writes `~/.buddydrive/config.toml`
 - **File restore** - once the daemon is running again, normal sync recreates missing local files from your buddy
 
+A buddy stores your folders for **one machine at a time**. Machines are told
+apart by a machine id kept in the data directory, not in `config.toml`, so a
+recovered config does not drag the old identity along. The first machine to back
+a folder up owns it there; another machine with the same identity is refused
+rather than silently overwriting the backup. `buddydrive recover` hands
+ownership to the new machine automatically — and if you moved `config.toml` by
+hand instead, run `buddydrive takeover` once before starting the daemon.
+
 Append-only folders still protect existing local files from being overwritten or deleted by the remote side.
 
 ### Connectivity Notes
@@ -193,12 +201,18 @@ buddydrive config set api-base-url https://api.buddydrive.org
 buddydrive config set relay-region eu
 ```
 
-- Per-buddy sync scheduling: set a sync window and interval for each buddy to control when to initiate connections:
+- Per-buddy sync scheduling: a window says when this machine may *start* a sync
+  with that buddy, and an interval says how often it tries. Incoming
+  connections from a known buddy are always accepted, whatever the window says.
 
 ```bash
 buddydrive config set buddy-sync-window <buddy-id> 22:00-06:00
 buddydrive config set buddy-sync-interval <buddy-id> 2h
 ```
+
+  Defaults: every 5 minutes until the two have made contact, then every 30
+  minutes; no window means any time. You can also ask for a sync right now
+  (`POST /sync` on the control API, or the Sync button in either GUI).
 
 ### Buddies on the Same Network
 

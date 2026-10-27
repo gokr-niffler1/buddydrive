@@ -115,11 +115,10 @@ The new sync model (described below) is now **largely implemented**. The origina
 
 - **Buddy-backed config fetch** — `syncConfigToBuddy()` and `fetchConfigFromBuddy()` are not implemented yet. Recovery currently only works via the relay path.
 - **`init --with-recovery`** — Parsed as a CLI flag but does nothing. Use `init` then `setup-recovery` separately.
-- **Connection reuse** — the daemon does not check for an existing transport connection before dialing.
-- **Long-lived CGNAT connections** — The CGNAT side does not yet maintain persistent/keepalive connections. It reconnects on each sync cycle.
+- **Long-lived CGNAT connections** — The CGNAT side does not yet maintain persistent/keepalive connections. Each session uses a fresh connection.
 - **Connection upgrade** — When a direct connection arrives and a relay connection already exists for that buddy, the relay connection is not yet automatically replaced.
 - **Large folder listings** — File list exchange uses a single framed message (30MB max). Pagination or streaming is deferred.
-- **`POST /sync/<folder>`** — accepted and answered with `ok`, but it does not start a session; sessions start when peers connect.
+- **Queued sync requests** — a request is served only by a running daemon; one queued while it is stopped waits for the next start.
 - **Manual direct dial** — `buddydrive connect` only prints guidance.
 
 ---
@@ -589,14 +588,15 @@ The relay verifies signatures using the verify key previously stored alongside t
 
 **Files**: `daemon.nim`, `types.nim`, `config.nim`, `p2p/discovery.nim`
 
-1. **Per-buddy sync_time** — `BuddyInfo.syncTime` field, config read/write, `shouldAttemptBuddySync` — DONE
+1. **Per-buddy sync window and interval** — `BuddyInfo.syncWindow`/`syncInterval`, config read/write, `isWithinSyncWindow`/`isSyncDue` — DONE. `syncTime` was replaced by a window (`HH:MM-HH:MM`, may wrap midnight) plus an interval (5m until first contact, then 30m by default), and `buddy-sync-time` remains an alias for the window
 2. **Discovery record extension** — `isPubliclyReachable: bool` and `syncTime: string` published in record — DONE
 3. **Deterministic initiator** — `shouldInitiate()` implements the CGNAT-correct rule — DONE
 4. **Remove incoming rejection** — `handleIncomingConnection` always accepts from known buddies — DONE
-5. **Scheduled dialing** — `connectToBuddies` respects per-buddy sync_time with 15-minute tolerance — DONE
-6. **Connection reuse** — checks for existing transport connections before new dial — NOT YET
-7. **Connection upgrade** — replace relay with direct when possible — NOT YET
-8. **Long-lived CGNAT connections** — keepalive and prompt redial — NOT YET
+5. **Scheduled dialing** — the discovery loop ticks once a minute and dials a buddy when its interval is due and its window is open — DONE
+6. **On-demand sync** — `POST /sync` and `POST /sync/<folder>` queue a request that the status loop serves — DONE
+7. **One session per connection** — a finished session drops its connection instead of leaving it marked ready, and a buddy dialing in mid-session is turned away rather than closing the running session — DONE
+8. **Connection upgrade** — replace relay with direct when possible — NOT YET
+9. **Long-lived CGNAT connections** — keepalive and prompt redial — NOT YET
 
 ### Phase F: Restore — PARTIALLY COMPLETE
 

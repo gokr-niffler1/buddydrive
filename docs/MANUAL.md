@@ -311,7 +311,7 @@ over that one connection, in two rounds (an *owner round* and a *storage round*)
 9. The session ends with a session-end exchange in a fixed order, so neither side
    hangs up while the other still has data in flight through a relay
 
-Wire protocol version is **5**; older peers are rejected at the handshake, so
+Wire protocol version is **7**; older peers are rejected at the handshake, so
 both buddies must run the same build generation.
 
 ### NAT Traversal
@@ -607,7 +607,7 @@ port — see below.
 6. A folder that cannot be fully read (unplugged disk, permissions) is skipped
    for that session and the log says so — that is deliberate: scanning it as
    empty used to delete the buddy's whole backup
-7. `POST /sync/<folder>` is a stub; it answers `ok` without starting anything
+7. `POST /sync` and `POST /sync/<folder>` only *queue* a request: the daemon's status loop picks it up within a couple of seconds, and only if it is running
 
 ### Address already in use
 
@@ -640,7 +640,7 @@ may share nothing (paths differ) — do not expect deduplication.
 - [ ] Connection reuse before dialing, and upgrading a relay connection to direct
 - [ ] Keepalive and prompt redial for long-lived CGNAT connections
 - [ ] Manual direct dial behind `buddydrive connect`
-- [ ] Working `POST /sync/<folder>` (currently a stub)
+- [ ] Retrying a queued sync request that could not be served
 - [ ] System tray integration
 - [ ] Auto-start on boot (a systemd unit ships in the Debian package)
 - [ ] Buddy-backed config fetch for recovery

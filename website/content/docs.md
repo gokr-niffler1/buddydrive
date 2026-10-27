@@ -113,15 +113,31 @@ Optional:
 - `--port <control-port>` - change the local control API port
 - `--daemon` - accepted, but currently continues in the foreground
 
-### Per-Buddy Sync Time
+### Per-Buddy Sync Window And Interval
 
-Each buddy can have an optional sync time that controls when to initiate connections. Incoming connections are always accepted:
+Two independent settings per buddy:
+
+- a **window** says when this machine may start a sync with that buddy
+- an **interval** says how often it tries
+
+Incoming connections from a known buddy are always accepted, whatever the window says.
 
 ```bash
-buddydrive config set buddy-sync-time <buddy-id> 03:00
+buddydrive config set buddy-sync-window <buddy-id> 22:00-06:00
+buddydrive config set buddy-sync-interval <buddy-id> 2h
 ```
 
-When empty (default), the daemon initiates whenever it discovers a buddy address.
+With no window (the default) any time will do. Intervals default to every 5
+minutes until the two have made contact, then every 30 minutes. Both accept
+`off`. `buddy-sync-time` is an alias for the window, and a bare `HH:MM` means the
+half hour around that time.
+
+To sync now instead of waiting, use the Sync button in either GUI or ask the
+daemon directly:
+
+```bash
+curl -s -X POST http://127.0.0.1:17521/sync
+```
 
 ### Connectivity Notes
 
@@ -177,11 +193,12 @@ buddydrive-gui
 
 ### Features
 
-- **Status panel** - daemon running, identity, uptime
-- **Folders list** - configured folders and sync status
-- **Buddies list** - paired buddies and their stored configuration
-- **Add folder dialog** - select path, name, encryption flag, and append-only mode
-- **Pair dialog** - generate or enter pairing details
+- **Status panel** - daemon running, identity, uptime, build
+- **Folders list** - each folder's state (synced, skipped, refused, failed, syncing) with the reason and last sync time; add, edit and remove folders, including which buddies it is shared with
+- **Buddies list** - paired buddies, their connection state, what each stores for you, and when their next sync is due
+- **Sync activity** - the running session with live counts, the last session, turned-away dials, and the last 30 sessions (also at `GET /sessions`)
+- **Buddies** - pair with a buddy, edit one, remove one, or ask for a sync now
+- **Settings** - relay settings, bandwidth limit and the GUI locale
 
 ## CLI Reference
 
@@ -197,7 +214,8 @@ buddydrive config set <key> ...        Update configuration values
   bandwidth-limit <kbps>               Set bandwidth limit (0 = unlimited)
   buddy-pairing-code <id> <code>       Set buddy pairing code
   buddy-name <id> <name>               Set buddy display name
-  buddy-sync-time <id> <HH:MM|off>     Set buddy sync time (off = always)
+  buddy-sync-window <id> <HH:MM-HH:MM|off>  Set when to start a sync (off = any time)
+  buddy-sync-interval <id> <30m|2h|off>     Set how often to sync (off = default)
   buddy-addresses <id> <addrs|none>    Set known addresses (e.g. a LAN buddy)
   buddy-storage-path <id> <path|default>  Where that buddy's backup is kept
   folder-append-only <name> on|off     Toggle folder append-only mode
@@ -335,7 +353,7 @@ buddydrive config
 3. Sessions run when the daemons connect; a live connection is left alone, so restart a side to force one
 4. Remember `buddydrive status` does not show live connection state; use the web GUI
 5. Missing files are restored through normal sync after connectivity returns
-6. `POST /sync/<folder>` is a stub that answers `ok` without starting anything
+6. `POST /sync` only queues a request; the daemon serves it within a couple of seconds, and only if it is running
 
 ## Next Steps
 

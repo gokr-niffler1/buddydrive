@@ -29,7 +29,7 @@ sequenceDiagram
         Note over CG,R,PB: relay splices the two TCP streams
     end
 
-    Note over CG,PB: 3 · Handshake (PairingProtocol, wire version 5)
+    Note over CG,PB: 3 · Handshake (PairingProtocol, wire version 7)
     CG->>PB: performHandshake()
     PB-->>CG: acceptHandshake()
 
@@ -52,10 +52,14 @@ sequenceDiagram
         CG-->>PB: msgFileAck
     end
 
+    Note over CG,PB: a folder owned by another machine is answered with<br/>msgFolderRefused instead of being overwritten
+
     Note over CG,PB: 5 · Session end in a fixed order
     CG->>PB: msgSessionEnd
     PB-->>CG: msgSessionEnd
     Note over CG,PB: responder waits for the initiator to hang up, so a relay<br/>cannot truncate a stream that still has bytes in flight
+
+    Note over CG,PB: 6 · The connection carries one session and is dropped.<br/>The next dial is scheduled by the buddy's interval and window
 ```
 
 ## Protocol Mounting
@@ -108,3 +112,5 @@ id*, renaming a folder does not orphan its backup.
 | Delete a file | Owner (`msgFileDelete`) | Removes the blob |
 | Restore a missing file | Owner requests | Serves the sealed chunks |
 | Append-only guard | Owner | Never overwrites an existing local file |
+| Which machine owns a folder | The first machine to back it up | Answers `msgFolderRefused` to any other machine with the same identity, until `recover`/`takeover` claims it |
+| When to start a sync | Each side, from its own buddy interval and window | Always accepts an incoming connection from a known buddy |
