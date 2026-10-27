@@ -70,6 +70,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- The test suite runs through a new `tests/testrunner.nim` instead of
+  `testament pattern`: test files are sharded into a few groups, compiled and
+  run in parallel, and the integration tests share one build of the daemon
+  binary. A warm `nimble test` now takes under two minutes instead of roughly
+  24. `nimble testSerial` keeps testament available for bisecting, and the
+  session-end timeouts are settable so tests no longer wait them out
+  (production defaults are unchanged).
 - Per-buddy sync window and interval, set per buddy from the CLI or the web
   Pair dialog. A buddy's sync time controls only when this side initiates;
   incoming connections from known buddies are always accepted. The dialing
