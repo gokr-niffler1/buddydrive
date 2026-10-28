@@ -145,8 +145,9 @@ journalctl -u buddydrive -f
 | `buddy-storage-path` | `<buddy-id> <path\|default>` | Folder where this buddy's backups are kept on your machine |
 | `folder-append-only` | `<folder-name> <on\|off>` | Toggle folder append-only mode |
 
-An unknown key (or a buddy/folder name that does not match) prints the help text
-rather than a specific error.
+An unknown key prints the help text rather than a specific error; a key that is
+understood but names a buddy or folder that does not exist says so
+(`Buddy not found: …`).
 
 ### add-folder Options
 
@@ -398,10 +399,16 @@ the Debian package sets them to `/etc/buddydrive` and `/var/lib/buddydrive`.
 | `<data>/index.db` | File metadata index (SQLite) |
 | `<data>/port` | Control API port (written after daemon startup) |
 | `<data>/buddydrive.log` | Log file |
+| `<data>/machine-id` | This installation's machine id, which decides folder ownership at a buddy |
+| `<data>/takeover-pending` | Buddies whose folders this machine is taking over (see below) |
+| `<data>/sync-request` | Folders a control-API sync request asked for |
 | `<data>/storage/<buddy-id>/<folder-id>/` | A buddy's backed-up folders (see above) |
 
-A stale `index.db` decides move/delete detection, so it is tied to a folder's
-name and path; deleting it just forces a full re-hash on the next session.
+`index.db` decides move and delete detection, so it matters. A folder's rows are
+kept under its **id and path**: renaming keeps them, tombstones included, while a
+new location starts afresh so the buddy's copy is restored there instead of being
+taken as a delete. Deleting `index.db` just forces a full re-hash on the next
+session.
 
 
 ## Web GUI
